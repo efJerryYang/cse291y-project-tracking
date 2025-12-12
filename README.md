@@ -6,8 +6,7 @@
 
 **Upstream**: [Wasmtime](https://github.com/bytecodealliance/wasmtime)
 
-- https://github.com/efJerryYang/wasmtime/tree/dev-preempt-rewrite
-- https://github.com/Blek1/wasmtime
+- Code Update: https://github.com/efJerryYang/wasmtime/tree/dev-preempt-rewrite
 
 <!-- **Milestones**: Check out the **[Projects](https://github.com/efJerryYang/cse291y-project-tracking/projects?query=is%3Aopen)** tab for more details: -->
 
