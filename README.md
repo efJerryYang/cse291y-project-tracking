@@ -8,6 +8,13 @@
 - Code Update: https://github.com/efJerryYang/wasmtime/tree/dev-preempt-rewrite
 - Note: at the moment, the fork is way behind the upstream due to conflicts, will only try to resolve it when we actually at the stage of submitting the PR.
 
+To test out the wasmtime code, clone that repository and switch to the `dev-preempt-rewrite` branch, setup the wasmtime local build and testing tools, then:
+
+```
+cargo run --release --example preempt_demo # this will run the looping context switch
+cargo run --release --example preempt_matmul_demo -- epoch # at the moment the 'fuel' is broken due to halfway through a required rewrite
+```
+
 <!-- **Milestones**: Check out the **[Projects](https://github.com/efJerryYang/cse291y-project-tracking/projects?query=is%3Aopen)** tab for more details: -->
 
 <!-- 1. ramp-ups: both of us will first work on some simple existing/wip issues in this repository to get an understanding of this project, some related to cranelift codegen, some related to wasmtime runtime. we will have a better understanding of the problems to solve after this stage.
