@@ -1,0 +1,3555 @@
+<instruction>
+Read the conversation between Jerry and Blek。当前这个report的写法非常糟糕，过于繁琐的代码粘贴导致可读性极差，而且整篇文章没有一个用于讲故事的核心。
+
+下面Jerry提供了两种思路，我感觉可以遵循，本质上我们想讲好两个故事，一个是threading，一个是interrupt implementation。而且这个报告也有大量的错误，（包括错误的说明当前实现用了hybrid approach但事实上没有）。
+
+请阅读代码的完整diff来理解到底实际上实现了什么。然后修改掉报告中明显错误的地方。对于引用，使用正确的refs.bib，这个对于typst语法是兼容了的.
+
+请以一个专业的角度将这个报告完善。讲好完成的故事。确保准确的引用，覆盖「
+Abstract, into, background, design, what we have done and results
+
+」这几个sections。
+
+值得注意的是，当前我们还没有完成的地方：没有支持多种scheduling，没有跑完NEAR core开发者的那个benchmarking，但我们可以assume是有提升的。
+
+未来期望与支持：以支持epoch interrupt, fuel interrupt, slacked fuel interrupt: https://github.com/bytecodealliance/wasmtime/issues/4109
+
+因为在他们的测量中，性能极好。
+
+最终我们期望能通过wasmtime的preemptive threading运行上述的三个benchmarking代码（每个代码重复执行一定次数，然后中间我们添加不同的scheduling逻辑），从而测定preeptive threading引入的实际overhead: direct sequential execution has no additional overhead, cooperative threading has only context switch overhead, preemptive threading has overhead of fuel-metering/epoch-interrupt.
+
+然后在他们的zulip中讨论当前的实现是否是一个可以添加到主分支中的feature。
+
+尤其注意，请不要使用过多的代码引用，我给你代码是为了让你阅读来了解当前的实现，而不是让你大篇幅的在report中引用。
+
+现在的状态是实现了epoch+fuel这两种interrupt，支持了多参数。然后可以跑矩阵乘法来简单的检查对比一下运行。
+
+还没有解决的问题是运行结束时fuel状态没有清理导致的panic，这个需要额外的工作来完善。
+
+</instruction>
+<history>
+c618ef39e (HEAD -> dev-preempt-rewrite) feat(preemptive): adjust default fuel slice and add demo
+6848ef749 (origin/dev-preempt-rewrite) refactor(examples): consolidate preemptive threads demos
+aeba56560 feat(preemptive): add configurable preemptive scheduling mode
+6d01d166a chroe(preemptive): remove unused method
+dfe1f1cf1 chore(demo): reduce the gas count for more frequent switch
+ddf29ca17 debug(preemptive): add debug thread names to fibers
+7b3bc2c6c chore(examples): rename preemptive threads demo files
+a14c92d3f feat(examples): add slower preemptive threads demo with sleep
+9dd32dc99 feat(fiber): support nested blocking context suspension
+6736f89d7 fix(examples): disable epoch interruption in preemptive threads demo
+4bf811440 fix(preemptive): add debug logging for fiber errors and fuel management
+7058fed5b fix(preemptive): fuel reset logic and include logging
+6d9c0044b refactor(preemptive): replace epoch interruption with fuel-based scheduling
+393217753 debug(demo): just for better demo, should remove in final history
+3ef9e3391 feat(preemptive): add background epoch ticker thread
+df96d1c30 feat(fiber): support nested preemptive yields via TLS
+04e7ae3d4 debug(preemptive): add debug logging for fiber scheduling
+1408e81c2 fix(runtime): expose method for fiber context check
+bce824bb8 build(deps): update futures crate features
+db3502479 feat(preemptive): support async wasm threads
+a3d27fa7f feat(runtime): add experimental preemptive wasm threads
+7f72d0c7b debug(fiber): add debug logging for stack switching
+</history>
+<gitdiff.diff>
+diff --git a/Cargo.toml b/Cargo.toml
+index 81c1b5361..c6c10a665 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -397,7 +397,7 @@ http = "1.3.1"
+ http-body = "1.0.1"
+ http-body-util = "0.1.3"
+ bytes = { version = "1.10.1", default-features = false }
+-futures = { version = "0.3.31", default-features = false }
++futures = { version = "0.3.31", default-features = false, features = ["std", "executor"] }
+ indexmap = { version = "2.11.4", default-features = false }
+ syn = "2.0.106"
+ quote = "1.0.41"
+diff --git a/crates/fiber/src/lib.rs b/crates/fiber/src/lib.rs
+index c1b4b3e60..ebb9765bf 100644
+--- a/crates/fiber/src/lib.rs
++++ b/crates/fiber/src/lib.rs
+@@ -13,10 +13,13 @@ extern crate std;
+ extern crate alloc;
+ 
+ use alloc::boxed::Box;
++use alloc::string::String;
+ use anyhow::Error;
+ use core::cell::Cell;
+ use core::marker::PhantomData;
+ use core::ops::Range;
++#[cfg(feature = "std")]
++use std::cell::RefCell;
+ 
+ cfg_if::cfg_if! {
+     if #[cfg(not(feature = "std"))] {
+@@ -139,6 +142,35 @@ pub struct Suspend<Resume, Yield, Return> {
+     _phantom: PhantomData<(Resume, Yield, Return)>,
+ }
+ 
++// Debug helpers to annotate fibers with human-friendly labels when std is
++// available (used by Wasmtime preemptive thread demos).
++#[cfg(feature = "std")]
++thread_local! {
++    static DEBUG_FIBER_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
++}
++
++/// Set a per-thread debug name for the currently running fiber.
++#[cfg(feature = "std")]
++pub fn set_debug_fiber_name(name: Option<&str>) {
++    use std::string::ToString;
++
++    DEBUG_FIBER_NAME.with(|slot| *slot.borrow_mut() = name.map(|s| s.to_string()));
++}
++
++/// Access the current fiber debug name, if any.
++#[cfg(feature = "std")]
++pub(crate) fn with_debug_fiber_name<R>(f: impl FnOnce(Option<&str>) -> R) -> R {
++    DEBUG_FIBER_NAME.with(|slot| f(slot.borrow().as_deref()))
++}
++
++#[cfg(not(feature = "std"))]
++pub fn set_debug_fiber_name(_name: Option<&str>) {}
++
++#[cfg(not(feature = "std"))]
++pub(crate) fn with_debug_fiber_name<R>(f: impl FnOnce(Option<&str>) -> R) -> R {
++    f(None)
++}
++
+ /// A structure that is stored on a stack frame of a call to `Fiber::resume`.
+ ///
+ /// This is used to both transmit data to a fiber (the resume step) as well as
+diff --git a/crates/fiber/src/stackswitch/x86_64.rs b/crates/fiber/src/stackswitch/x86_64.rs
+index eb3ec3698..a6e74b21c 100644
+--- a/crates/fiber/src/stackswitch/x86_64.rs
++++ b/crates/fiber/src/stackswitch/x86_64.rs
+@@ -5,10 +5,16 @@
+ // all the other bits. Documentation tries to reference various bits here and
+ // there but try to make sure to read over everything before tweaking things!
+ 
++use crate::with_debug_fiber_name;
+ use core::arch::naked_asm;
+ 
+ #[inline(never)] // FIXME(rust-lang/rust#148307)
+ pub(crate) unsafe extern "C" fn wasmtime_fiber_switch(top_of_stack: *mut u8) {
++    let name = with_debug_fiber_name(|n| n.map(|s| format!("[{s}]")).unwrap_or_default());
++    eprintln!(
++        "[preempt][fiber]{name} switching to fiber stack top={:#018x}",
++        top_of_stack as usize,
++    );
+     unsafe { wasmtime_fiber_switch_(top_of_stack) }
+ }
+ 
+diff --git a/crates/wasmtime/src/config.rs b/crates/wasmtime/src/config.rs
+index 07fed8ccf..d51745528 100644
+--- a/crates/wasmtime/src/config.rs
++++ b/crates/wasmtime/src/config.rs
+@@ -154,6 +154,10 @@ pub struct Config {
+     #[cfg(feature = "async")]
+     pub(crate) stack_creator: Option<Arc<dyn RuntimeFiberStackCreator>>,
+     pub(crate) async_support: bool,
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub(crate) preemptive_mode: PreemptiveMode,
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub(crate) wasm_preemptive_threads: bool,
+     pub(crate) module_version: ModuleVersionStrategy,
+     pub(crate) parallel_compilation: bool,
+     pub(crate) memory_guaranteed_dense_image_size: u64,
+@@ -167,6 +171,20 @@ pub struct Config {
+     pub(crate) shared_memory: bool,
+ }
+ 
++/// Selects how preemptive wasm threads are time-sliced when
++/// [`Config::wasm_preemptive_threads`] is enabled.
++#[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PreemptiveMode {
++    /// Use fuel-based metering to trigger yields. Requires
++    /// [`Config::consume_fuel(true)`](Config::consume_fuel).
++    Fuel,
++    /// Use epoch-based deadlines to trigger yields. Requires
++    /// [`Config::epoch_interruption(true)`](Config::epoch_interruption) and an
++    /// epoch tick source.
++    Epoch,
++}
++
+ /// User-provided configuration for the compiler.
+ #[cfg(any(feature = "cranelift", feature = "winch"))]
+ #[derive(Debug, Clone)]
+@@ -261,6 +279,10 @@ impl Config {
+             #[cfg(feature = "async")]
+             stack_creator: None,
+             async_support: false,
++            #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++            preemptive_mode: PreemptiveMode::Fuel,
++            #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++            wasm_preemptive_threads: false,
+             module_version: ModuleVersionStrategy::default(),
+             parallel_compilation: !cfg!(miri),
+             memory_guaranteed_dense_image_size: 16 << 20,
+@@ -1151,6 +1173,30 @@ impl Config {
+         self
+     }
+ 
++    /// Enables experimental single-threaded preemptive scheduling of wasm
++    /// threads using Wasmtime's stack-switching runtime.
++    ///
++    /// Requires `async_support`. The active [`PreemptiveMode`] determines the
++    /// instrumentation requirement:
++    /// - `PreemptiveMode::Fuel` requires [`consume_fuel`](Config::consume_fuel).
++    /// - `PreemptiveMode::Epoch` requires [`epoch_interruption`](Config::epoch_interruption)
++    ///   and a ticking source for [`Engine::increment_epoch`](crate::Engine::increment_epoch).
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub fn wasm_preemptive_threads(&mut self, enable: bool) -> &mut Self {
++        self.wasm_preemptive_threads = enable;
++        self
++    }
++
++    /// Selects whether preemptive scheduling uses fuel or epoch deadlines.
++    ///
++    /// Defaults to [`PreemptiveMode::Fuel`]. Does not flip the
++    /// `wasm_preemptive_threads` flag itself.
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub fn wasm_preemptive_threads_mode(&mut self, mode: PreemptiveMode) -> &mut Self {
++        self.preemptive_mode = mode;
++        self
++    }
++
+     /// Configures whether the WebAssembly component-model [proposal] will
+     /// be enabled for compilation.
+     ///
+diff --git a/crates/wasmtime/src/lib.rs b/crates/wasmtime/src/lib.rs
+index e8245220b..55af65bf3 100644
+--- a/crates/wasmtime/src/lib.rs
++++ b/crates/wasmtime/src/lib.rs
+@@ -388,6 +388,11 @@ mod runtime;
+ #[cfg(feature = "runtime")]
+ pub use runtime::*;
+ 
++#[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++mod preemptive;
++#[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++pub use preemptive::WasmThreadHandle;
++
+ #[cfg(any(feature = "cranelift", feature = "winch"))]
+ mod compile;
+ #[cfg(any(feature = "cranelift", feature = "winch"))]
+diff --git a/crates/wasmtime/src/preemptive.rs b/crates/wasmtime/src/preemptive.rs
+new file mode 100644
+index 000000000..010a80afc
+--- /dev/null
++++ b/crates/wasmtime/src/preemptive.rs
+@@ -0,0 +1,260 @@
++//! Internal preemptive scheduling support for running multiple wasm exports on
++//! a single host thread. This builds on the fiber-based async runtime and
++//! interruption/fuel to force stack-switching without relying on a multi-
++//! threaded host executor.
++//!
++//! This module intentionally exposes only the small surface needed by
++//! `Store::spawn_wasm_thread`, `run_wasm_threads_for`, and
++//! `shutdown_wasm_threads`.
++
++#![cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++
++use crate::StoreContextMut;
++use crate::TypedFunc;
++use crate::prelude::*;
++use crate::runtime::fiber::{StoreFiber, StoreFiberYield, resume_fiber};
++use crate::runtime::store::AsStoreOpaque;
++use crate::{PreemptiveMode, UpdateDeadline};
++use core::mem;
++use futures::task::noop_waker;
++use std::collections::{HashMap, HashSet, VecDeque};
++use std::ptr::NonNull;
++use std::sync::{
++    Arc,
++    atomic::{AtomicBool, Ordering},
++};
++use std::task::Context;
++use std::thread;
++use std::time::{Duration, Instant};
++use wasmtime_fiber::set_debug_fiber_name;
++
++/// Opaque handle returned to the embedder for spawned wasm threads.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct WasmThreadHandle {
++    pub(crate) id: u32,
++}
++
++pub(crate) struct PreemptiveThreads {
++    threads: HashMap<u32, StoreFiber<'static>>,
++    run_queue: VecDeque<u32>,
++    enqueued: HashSet<u32>,
++    current: Option<u32>,
++    next_id: u32,
++    names: HashMap<u32, String>,
++    timeslice: u64,
++    mode: PreemptiveMode,
++    epoch_installed: bool,
++    ticker_stop: Option<Arc<AtomicBool>>,
++    ticker_handle: Option<thread::JoinHandle<()>>,
++    shutdown: bool,
++}
++
++impl PreemptiveThreads {
++    pub(crate) fn new(timeslice: u64, mode: PreemptiveMode) -> Self {
++        Self {
++            timeslice,
++            threads: HashMap::new(),
++            run_queue: VecDeque::new(),
++            enqueued: HashSet::new(),
++            current: None,
++            next_id: 0,
++            names: HashMap::new(),
++            mode,
++            epoch_installed: false,
++            ticker_stop: None,
++            ticker_handle: None,
++            shutdown: false,
++        }
++    }
++
++    fn enqueue(&mut self, id: u32) {
++        if self.enqueued.insert(id) {
++            self.run_queue.push_back(id);
++        }
++    }
++
++    fn pop_next(&mut self) -> Option<u32> {
++        while let Some(id) = self.run_queue.pop_front() {
++            if self.threads.contains_key(&id) {
++                self.enqueued.remove(&id);
++                self.current = Some(id);
++                return Some(id);
++            }
++        }
++        None
++    }
++
++    pub(crate) fn spawn<T: Send + 'static, P: crate::WasmParams + Send + Sync + 'static>(
++        &mut self,
++        store: &mut crate::store::StoreInner<T>,
++        func: TypedFunc<P, ()>,
++        name: String,
++        params: P,
++    ) -> Result<WasmThreadHandle> {
++        if matches!(self.mode, PreemptiveMode::Epoch) {
++            self.install_epoch_callback(store);
++        }
++        let id = self.next_id;
++        self.next_id = self.next_id.wrapping_add(1);
++
++        eprintln!("[preempt][spawn] fiber {id} for export");
++
++        // Run the wasm export on its own fiber; epoch-driven yields will
++        // suspend the fiber with `StoreFiberYield::ReleaseStore` when
++        // `wasm_preemptive_threads` is enabled.
++        let func_clone = func.clone();
++        let fiber = unsafe {
++            crate::runtime::fiber::make_fiber_unchecked(store, move |store| {
++                let store_ctx = StoreContextMut(store);
++                let params = params;
++                store_ctx.block_on(|mut cx| {
++                    Box::pin(async move { func_clone.call_async(&mut cx, params).await })
++                })?
++            })?
++        };
++
++        self.enqueue(id);
++        self.names.insert(id, name);
++        self.threads.insert(id, fiber);
++        Ok(WasmThreadHandle { id })
++    }
++
++    pub(crate) fn run_for<T>(
++        &mut self,
++        store: &mut crate::store::StoreInner<T>,
++        duration: Duration,
++    ) -> Result<()> {
++        let start = Instant::now();
++        let waker = noop_waker();
++        let mut cx = Context::from_waker(&waker);
++
++        let slice = self.timeslice.max(1);
++        match self.mode {
++            PreemptiveMode::Fuel => {
++                self.stop_epoch_ticker();
++                eprintln!("[preempt][fuel] configuring slice={slice}");
++                store.fuel_async_yield_interval(Some(slice))?;
++                store.set_fuel(u64::MAX)?;
++            }
++            PreemptiveMode::Epoch => {
++                self.install_epoch_callback(store);
++                self.ensure_epoch_ticker(store.engine());
++                eprintln!("[preempt][epoch] deadline slice={slice}");
++                store.set_epoch_deadline(slice);
++            }
++        }
++
++        while !self.shutdown && start.elapsed() < duration {
++            eprintln!("[preempt][run] loop tick");
++
++            let Some(id) = self.pop_next() else {
++                eprintln!("[preempt][run] run queue empty");
++                break;
++            };
++
++            eprintln!("[preempt][run] schedule fiber {id}");
++            {
++                let fiber = self.threads.get_mut(&id).unwrap();
++                let cx_static: &mut Context<'static> = unsafe { mem::transmute(&mut cx) };
++                let debug_name = self.names.get(&id).map(|s| s.as_str());
++                set_debug_fiber_name(debug_name);
++                match resume_fiber(store.as_store_opaque(), fiber, Ok(NonNull::from(cx_static))) {
++                    Ok(Ok(())) => {
++                        eprintln!("[preempt][run] fiber {id} completed");
++                        self.finish(id);
++                    }
++                    Ok(Err(err)) => {
++                        eprintln!("fiber {id} returned error: {err:?}");
++                        eprintln!("[preempt][run] fiber {id} returned error: {err:?}");
++                        self.finish(id);
++                    }
++                    Err(StoreFiberYield::KeepStore) | Err(StoreFiberYield::ReleaseStore) => {
++                        eprintln!("[preempt][run] fiber {id} yielded");
++                        self.enqueue(id);
++                    }
++                }
++                set_debug_fiber_name(None);
++            }
++
++            self.current = None;
++        }
++
++        if matches!(self.mode, PreemptiveMode::Epoch) {
++            self.stop_epoch_ticker();
++        }
++
++        Ok(())
++    }
++
++    pub(crate) fn shutdown<T>(&mut self, store: &mut crate::store::StoreInner<T>) {
++        self.shutdown = true;
++        for (_id, fiber) in self.threads.iter_mut() {
++            fiber.dispose(store.as_store_opaque());
++        }
++        self.stop_epoch_ticker();
++        self.threads.clear();
++        self.run_queue.clear();
++        self.enqueued.clear();
++        self.current = None;
++        self.names.clear();
++    }
++
++    fn finish(&mut self, id: u32) {
++        self.enqueued.remove(&id);
++        self.threads.remove(&id);
++        self.names.remove(&id);
++        if self.current == Some(id) {
++            self.current = None;
++        }
++    }
++
++    fn install_epoch_callback<T>(&mut self, store: &mut crate::store::StoreInner<T>) {
++        if self.epoch_installed {
++            return;
++        }
++        let timeslice = self.timeslice.max(1);
++        store.epoch_deadline_callback(Box::new(move |ctx: StoreContextMut<'_, T>| {
++            let opaque = ctx.0.as_store_opaque();
++            opaque.preemptive_threads_mut().on_epoch_tick();
++            Ok(UpdateDeadline::Yield(timeslice))
++        }));
++        self.epoch_installed = true;
++    }
++
++    pub(crate) fn on_epoch_tick(&mut self) {
++        if let Some(id) = self.current.take() {
++            eprintln!("[preempt][epoch] tick: requeue fiber {id}");
++            self.enqueue(id);
++        } else {
++            eprintln!("[preempt][epoch] tick: no current fiber");
++        }
++    }
++
++    fn ensure_epoch_ticker(&mut self, engine: &crate::Engine) {
++        if self.ticker_handle.is_some() {
++            return;
++        }
++        let stop = Arc::new(AtomicBool::new(false));
++        let stop_clone = stop.clone();
++        let engine = engine.clone();
++        // Pace epoch increments to avoid thrashing;
++        let interval = Duration::from_micros(self.timeslice.max(1) * 64);
++        let handle = thread::spawn(move || {
++            while !stop_clone.load(Ordering::Relaxed) {
++                engine.increment_epoch();
++                thread::sleep(interval);
++            }
++        });
++        self.ticker_stop = Some(stop);
++        self.ticker_handle = Some(handle);
++    }
++
++    fn stop_epoch_ticker(&mut self) {
++        if let Some(stop) = self.ticker_stop.take() {
++            stop.store(true, Ordering::Relaxed);
++        }
++        if let Some(handle) = self.ticker_handle.take() {
++            let _ = handle.join();
++        }
++    }
++}
+diff --git a/crates/wasmtime/src/runtime/fiber.rs b/crates/wasmtime/src/runtime/fiber.rs
+index 68dce6884..0b70fb2b6 100644
+--- a/crates/wasmtime/src/runtime/fiber.rs
++++ b/crates/wasmtime/src/runtime/fiber.rs
+@@ -4,6 +4,7 @@ use crate::vm::mpk::{self, ProtectionMask};
+ use crate::vm::{AlwaysMut, AsyncWasmCallState};
+ use crate::{Engine, StoreContextMut};
+ use anyhow::{Result, anyhow};
++use core::cell::Cell;
+ use core::mem;
+ use core::ops::Range;
+ use core::pin::Pin;
+@@ -111,6 +112,39 @@ impl AsyncState {
+     pub(crate) fn last_fiber_stack(&mut self) -> &mut Option<wasmtime_fiber::FiberStack> {
+         &mut self.last_fiber_stack
+     }
++
++    /// Returns whether a fiber is currently running with valid suspend/context pointers.
++    pub(crate) fn has_current_context(&self) -> bool {
++        self.current_suspend.is_some() && self.current_future_cx.is_some()
++    }
++
++    /// Debug helper for preemptive scheduler logging.
++    pub(crate) fn debug_flags(&self) -> (bool, bool) {
++        (
++            self.current_suspend.is_some(),
++            self.current_future_cx.is_some(),
++        )
++    }
++}
++
++thread_local! {
++    static CURRENT_BLOCKING: Cell<*mut BlockingContext<'static, 'static>> =
++        Cell::new(ptr::null_mut());
++}
++
++/// Expose the currently active `BlockingContext`, if any.
++pub(crate) fn with_current_blocking<R>(
++    f: impl FnOnce(Option<NonNull<BlockingContext<'static, 'static>>>) -> R,
++) -> R {
++    CURRENT_BLOCKING.with(|slot| {
++        let ptr = slot.get();
++        if ptr.is_null() {
++            f(None)
++        } else {
++            // SAFETY: lifetime is bounded by surrounding `with_blocking`.
++            f(Some(unsafe { NonNull::new_unchecked(ptr) }))
++        }
++    })
+ }
+ 
+ /// A helper structure used to block a fiber.
+@@ -203,7 +237,14 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
+             store,
+             cx: BlockingContext { future_cx, suspend },
+         };
+-        return f(&mut reset.store, &mut reset.cx);
++
++        // Expose the current blocking context for nested suspend requests.
++        let prev = CURRENT_BLOCKING.with(|slot| {
++            slot.replace(&mut reset.cx as *mut _ as *mut BlockingContext<'static, 'static>)
++        });
++        let result = f(&mut reset.store, &mut reset.cx);
++        CURRENT_BLOCKING.with(|slot| slot.set(prev));
++        return result;
+ 
+         struct ResetBlockingContext<'a, 'b, S: AsStoreOpaque> {
+             store: &'a mut S,
+@@ -673,7 +714,7 @@ fn swap_mpk_states(mask: Option<ProtectionMask>) -> Option<ProtectionMask> {
+ /// returned value; it will return `Err(yield_)` if the fiber suspended, where
+ /// `yield_` indicates whether it released access to the store or not.  See
+ /// `StoreFiber::fiber` for details.
+-fn resume_fiber<'a>(
++pub(crate) fn resume_fiber<'a>(
+     store: &mut StoreOpaque,
+     fiber: &mut StoreFiber<'a>,
+     result: WasmtimeResume,
+diff --git a/crates/wasmtime/src/runtime/store.rs b/crates/wasmtime/src/runtime/store.rs
+index 710ff8ca6..aac59d318 100644
+--- a/crates/wasmtime/src/runtime/store.rs
++++ b/crates/wasmtime/src/runtime/store.rs
+@@ -80,6 +80,8 @@
+ use crate::DebugHandler;
+ #[cfg(all(feature = "gc", feature = "debug"))]
+ use crate::OwnedRooted;
++#[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++use crate::PreemptiveMode;
+ use crate::RootSet;
+ #[cfg(feature = "gc")]
+ use crate::ThrownException;
+@@ -90,6 +92,7 @@ use crate::component::concurrent;
+ #[cfg(feature = "async")]
+ use crate::fiber;
+ use crate::module::RegisteredModuleId;
++use crate::preemptive::{PreemptiveThreads, WasmThreadHandle};
+ use crate::prelude::*;
+ #[cfg(feature = "gc")]
+ use crate::runtime::vm::GcRootsList;
+@@ -108,6 +111,7 @@ use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
+ use crate::{ExnRef, Rooted};
+ use crate::{Global, Instance, Table, Uninhabited};
+ use alloc::sync::Arc;
++use anyhow::ensure;
+ use core::fmt;
+ use core::marker;
+ use core::mem::{self, ManuallyDrop, MaybeUninit};
+@@ -506,6 +510,8 @@ pub struct StoreOpaque {
+     table_limit: usize,
+     #[cfg(feature = "async")]
+     async_state: fiber::AsyncState,
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    preemptive_threads: PreemptiveThreads,
+ 
+     // If fuel_yield_interval is enabled, then we store the remaining fuel (that isn't in
+     // runtime_limits) here. The total amount of fuel is the runtime limits and reserve added
+@@ -740,6 +746,16 @@ impl<T> Store<T> {
+             table_limit: crate::DEFAULT_TABLE_LIMIT,
+             #[cfg(feature = "async")]
+             async_state: Default::default(),
++            #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++            // default slice: slower for fuel to reduce churn, faster for epoch
++            // to keep deadline checks responsive.
++            preemptive_threads: PreemptiveThreads::new(
++                match engine.config().preemptive_mode {
++                    crate::PreemptiveMode::Fuel => 200,
++                    crate::PreemptiveMode::Epoch => 100,
++                },
++                engine.config().preemptive_mode,
++            ),
+             fuel_reserve: 0,
+             fuel_yield_interval: None,
+             store_data,
+@@ -827,6 +843,76 @@ impl<T> Store<T> {
+         self.inner.data_mut()
+     }
+ 
++    /// Spawn a wasm export as a preemptively scheduled wasm thread.
++    ///
++    /// Supports any parameter list expressible via [`WasmParams`] with a
++    /// `()` result. Requires `Config::wasm_preemptive_threads(true)`.
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub fn spawn_wasm_thread<P>(
++        &mut self,
++        instance: &crate::Instance,
++        export: &str,
++        params: P,
++    ) -> Result<WasmThreadHandle>
++    where
++        T: Send + 'static,
++        P: crate::WasmParams + Send + Sync + 'static,
++    {
++        ensure!(
++            self.inner.engine.config().wasm_preemptive_threads,
++            "preemptive wasm threads require Config::wasm_preemptive_threads(true)"
++        );
++        match self.inner.engine.config().preemptive_mode {
++            PreemptiveMode::Fuel => ensure!(
++                self.inner.engine.tunables().consume_fuel,
++                "preemptive (fuel mode) requires Config::consume_fuel(true)"
++            ),
++            PreemptiveMode::Epoch => ensure!(
++                self.inner.engine.tunables().epoch_interruption,
++                "preemptive (epoch mode) requires Config::epoch_interruption(true)"
++            ),
++        }
++        let func = instance.get_typed_func::<P, ()>(&mut *self, export)?;
++        let handle = {
++            let threads: *mut PreemptiveThreads = self.inner.preemptive_threads_mut() as *mut _;
++            unsafe { (*threads).spawn(&mut self.inner, func, export.to_string(), params)? }
++        };
++        Ok(handle)
++    }
++
++    /// Run all preemptively scheduled wasm threads for up to `duration`.
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub fn run_wasm_threads_for(&mut self, duration: std::time::Duration) -> Result<()> {
++        if !self.inner.engine.config().wasm_preemptive_threads {
++            return Ok(());
++        }
++        match self.inner.engine.config().preemptive_mode {
++            PreemptiveMode::Fuel => ensure!(
++                self.inner.engine.tunables().consume_fuel,
++                "preemptive (fuel mode) requires Config::consume_fuel(true)"
++            ),
++            PreemptiveMode::Epoch => ensure!(
++                self.inner.engine.tunables().epoch_interruption,
++                "preemptive (epoch mode) requires Config::epoch_interruption(true)"
++            ),
++        }
++        let threads: *mut PreemptiveThreads = self.inner.preemptive_threads_mut() as *mut _;
++        unsafe { (*threads).run_for(&mut self.inner, duration) }
++    }
++
++    /// Stop all preemptively scheduled wasm threads and dispose their fibers.
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub fn shutdown_wasm_threads(&mut self) -> Result<()> {
++        if !self.inner.engine.config().wasm_preemptive_threads {
++            return Ok(());
++        }
++        let threads: *mut PreemptiveThreads = self.inner.preemptive_threads_mut() as *mut _;
++        unsafe {
++            (*threads).shutdown(&mut self.inner);
++        }
++        Ok(())
++    }
++
+     fn run_manual_drop_routines(&mut self) {
+         // We need to drop the fibers of each component instance before
+         // attempting to drop the instances themselves since the fibers may need
+@@ -1536,10 +1622,15 @@ fn refuel(
+     yield_interval: Option<NonZeroU64>,
+ ) -> bool {
+     let fuel = get_fuel(*injected_fuel, *fuel_reserve);
++    eprintln!(
++        "[preempt][fuel] refuel: injected={} reserve={} interval={:?} fuel={}",
++        *injected_fuel, *fuel_reserve, yield_interval, fuel
++    );
+     if fuel > 0 {
+         set_fuel(injected_fuel, fuel_reserve, yield_interval, fuel);
+         true
+     } else {
++        eprintln!("[preempt][fuel] refuel: no fuel available, returning false");
+         false
+     }
+ }
+@@ -1562,6 +1653,10 @@ fn set_fuel(
+     // Within the VM we increment to count fuel, so inject a negative amount. The VM will halt when
+     // this counter is positive.
+     *injected_fuel = -(injected as i64);
++    eprintln!(
++        "[preempt][fuel] set_fuel: new_fuel={} interval={} injected={} reserve={}",
++        new_fuel_amount, interval, *injected_fuel, *fuel_reserve
++    );
+ }
+ 
+ #[doc(hidden)]
+@@ -1601,6 +1696,55 @@ impl StoreOpaque {
+         cfg!(feature = "async") && self.engine().config().async_support
+     }
+ 
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub(crate) async fn preemptive_yield(&mut self) -> Result<()> {
++        if !self.preemptive_enabled() {
++            return Ok(());
++        }
++        if !self.async_state.has_current_context() {
++            // Try to use the in-flight BlockingContext if we're inside
++            // `with_blocking` (e.g. fuel out-of-gas path).
++            let mut suspended = false;
++            crate::runtime::fiber::with_current_blocking(|maybe| {
++                if let Some(mut cx) = maybe {
++                    eprintln!("[preempt][yield] using current blocking ctx to suspend");
++                    suspended = unsafe {
++                        cx.as_mut()
++                            .suspend(crate::runtime::fiber::StoreFiberYield::ReleaseStore)
++                            .is_ok()
++                    };
++                }
++            });
++            if suspended {
++                eprintln!("[preempt][yield] resumed fiber after suspension (blocking ctx)");
++            } else {
++                eprintln!("[preempt][yield] skipped: no current async context");
++            }
++            return Ok(());
++        }
++        let (suspend_present, cx_present) = self.async_state.debug_flags();
++        eprintln!(
++            "[preempt][yield] suspending fiber (suspend? {} cx? {})",
++            suspend_present, cx_present
++        );
++        self.with_blocking(|_, cx| {
++            cx.suspend(crate::runtime::fiber::StoreFiberYield::ReleaseStore)
++        })?;
++        eprintln!("[preempt][yield] resumed fiber after suspension");
++        Ok(())
++    }
++
++    #[inline]
++    pub(crate) fn preemptive_yield_blocking(&mut self) -> Result<()> {
++        if !self.preemptive_enabled() {
++            return Ok(());
++        }
++        self.with_blocking(|_, cx| {
++            cx.suspend(crate::runtime::fiber::StoreFiberYield::ReleaseStore)
++        })?;
++        Ok(())
++    }
++
+     #[inline]
+     pub fn engine(&self) -> &Engine {
+         &self.engine
+@@ -2496,6 +2640,16 @@ at https://bytecodealliance.org/security.
+         &mut self.async_state
+     }
+ 
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub(crate) fn preemptive_threads_mut(&mut self) -> &mut PreemptiveThreads {
++        &mut self.preemptive_threads
++    }
++
++    #[cfg(all(feature = "runtime", feature = "async", target_has_atomic = "64"))]
++    pub(crate) fn preemptive_enabled(&self) -> bool {
++        self.engine().config().wasm_preemptive_threads
++    }
++
+     #[cfg(feature = "component-model-async")]
+     pub(crate) fn concurrent_state_mut(&mut self) -> &mut concurrent::ConcurrentState {
+         &mut self.concurrent_state
+@@ -2774,7 +2928,7 @@ impl<T> StoreInner<T> {
+     }
+ 
+     #[cfg(target_has_atomic = "64")]
+-    fn epoch_deadline_callback(
++    pub(crate) fn epoch_deadline_callback(
+         &mut self,
+         callback: Box<dyn FnMut(StoreContextMut<T>) -> Result<UpdateDeadline> + Send + Sync>,
+     ) {
+diff --git a/crates/wasmtime/src/runtime/vm/libcalls.rs b/crates/wasmtime/src/runtime/vm/libcalls.rs
+index 5c384f9b2..8d7a54f43 100644
+--- a/crates/wasmtime/src/runtime/vm/libcalls.rs
++++ b/crates/wasmtime/src/runtime/vm/libcalls.rs
+@@ -1240,12 +1240,26 @@ fn memory_atomic_wait64(
+ // Hook for when an instance runs out of fuel.
+ fn out_of_gas(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+     block_on!(store, async |store| {
++        eprintln!(
++            "[preempt][fuel] out_of_gas: preemptive={} yield_interval={:?}",
++            store.preemptive_enabled(),
++            store.fuel_yield_interval
++        );
+         if !store.refuel() {
+-            return Err(Trap::OutOfFuel.into());
++            if store.preemptive_enabled() {
++                eprintln!("[preempt][fuel] refuel depleted; resetting fuel to u64::MAX");
++                store.set_fuel(u64::MAX)?;
++            } else {
++                return Err(Trap::OutOfFuel.into());
++            }
+         }
+         #[cfg(feature = "async")]
+         if store.fuel_yield_interval.is_some() {
+-            crate::runtime::vm::Yield::new().await;
++            if store.preemptive_enabled() {
++                store.preemptive_yield().await?;
++            } else {
++                crate::runtime::vm::Yield::new().await;
++            }
+         }
+         Ok(())
+     })?
+@@ -1257,6 +1271,35 @@ fn new_epoch(store: &mut dyn VMStore, _instance: InstanceId) -> Result<NextEpoch
+     use crate::UpdateDeadline;
+ 
+     let update_deadline = store.new_epoch_updated_deadline()?;
++    if store.preemptive_enabled() {
++        let delta = match update_deadline {
++            UpdateDeadline::Interrupt => return Err(Trap::Interrupt.into()),
++            UpdateDeadline::Continue(delta) => delta,
++            #[cfg(feature = "async")]
++            UpdateDeadline::Yield(delta) => {
++                assert!(
++                    store.async_support(),
++                    "cannot use `UpdateDeadline::Yield` without enabling \
++                     async support in the config"
++                );
++                store.preemptive_yield_blocking()?;
++                delta
++            }
++            #[cfg(feature = "async")]
++            UpdateDeadline::YieldCustom(delta, _future) => {
++                assert!(
++                    store.async_support(),
++                    "cannot use `UpdateDeadline::YieldCustom` without enabling \
++                     async support in the config"
++                );
++                store.preemptive_yield_blocking()?;
++                delta
++            }
++        };
++        store.set_epoch_deadline(delta);
++        return Ok(NextEpoch(store.get_epoch_deadline()));
++    }
++
+     block_on!(store, async move |store| {
+         let delta = match update_deadline {
+             UpdateDeadline::Interrupt => return Err(Trap::Interrupt.into()),
+@@ -1278,13 +1321,12 @@ fn new_epoch(store: &mut dyn VMStore, _instance: InstanceId) -> Result<NextEpoch
+                 delta
+             }
+             #[cfg(feature = "async")]
+-            UpdateDeadline::YieldCustom(delta, future) => {
++            UpdateDeadline::YieldCustom(delta, _future) => {
+                 assert!(
+                     store.async_support(),
+                     "cannot use `UpdateDeadline::YieldCustom` without enabling \
+                      async support in the config"
+                 );
+-                future.await;
+                 delta
+             }
+         };
+diff --git a/examples/preempt_demo.rs b/examples/preempt_demo.rs
+new file mode 100644
+index 000000000..dafc0c8c0
+--- /dev/null
++++ b/examples/preempt_demo.rs
+@@ -0,0 +1,74 @@
++//! Demonstrates preemptive scheduling of three wasm loops on a single host
++//! thread, each doing a small host-side sleep every iteration to slow things
++//! down and make interleaving obvious.
++//!
++//! Run with:
++//! `cargo run --example preemptive_threads_demo_slow`
++
++use anyhow::Result;
++use futures::executor::block_on;
++use std::time::Duration;
++use wasmtime::{
++    Caller, Config, Engine, Linker, Module, PreemptiveMode, Store, WasmThreadHandle,
++};
++
++struct HostState;
++
++fn main() -> Result<()> {
++    let mode = match std::env::args().nth(1).as_deref() {
++        Some("epoch") => PreemptiveMode::Epoch,
++        _ => PreemptiveMode::Fuel,
++    };
++
++    let mut config = Config::new();
++    config.async_support(true);
++    config.wasm_threads(true);
++    config.wasm_stack_switching(true);
++    config.wasm_preemptive_threads_mode(mode);
++    match mode {
++        PreemptiveMode::Fuel => {
++            // Preemption is driven by fuel; avoid epoch traps.
++            config.consume_fuel(true);
++            config.epoch_interruption(false);
++        }
++        PreemptiveMode::Epoch => {
++            // Epoch-based preemption; no fuel instrumentation needed here.
++            config.consume_fuel(false);
++            config.epoch_interruption(true);
++        }
++    }
++    config.wasm_preemptive_threads(true);
++
++    let engine = Engine::new(&config)?;
++    let wat_src = include_str!("preempt_demo.wat");
++    let wasm = wat::parse_str(wat_src)?;
++    let module = Module::new(&engine, &wasm)?;
++
++    let mut linker = Linker::new(&engine);
++    linker.func_wrap("env", "log0", |_: Caller<'_, HostState>, v: i32| {
++        println!("[thread0] {v}");
++    })?;
++    linker.func_wrap("env", "log1", |_: Caller<'_, HostState>, v: i32| {
++        println!("[thread1] {v}");
++    })?;
++    linker.func_wrap("env", "log2", |_: Caller<'_, HostState>, v: i32| {
++        println!("[thread2] {v}");
++    })?;
++    linker.func_wrap("env", "sleep_ms", |_: Caller<'_, HostState>, ms: i32| {
++        if ms > 0 {
++            std::thread::sleep(Duration::from_millis(ms as u64));
++        }
++    })?;
++
++    let mut store = Store::new(&engine, HostState);
++    let instance = block_on(linker.instantiate_async(&mut store, &module))?;
++
++    let _t0: WasmThreadHandle = store.spawn_wasm_thread(&instance, "thread0", ())?;
++    let _t1: WasmThreadHandle = store.spawn_wasm_thread(&instance, "thread1", ())?;
++    let _t2: WasmThreadHandle = store.spawn_wasm_thread(&instance, "thread2", ())?;
++
++    store.run_wasm_threads_for(Duration::from_secs(10))?;
++    store.shutdown_wasm_threads()?;
++
++    Ok(())
++}
+diff --git a/examples/preempt_demo.wat b/examples/preempt_demo.wat
+new file mode 100644
+index 000000000..6e63c049d
+--- /dev/null
++++ b/examples/preempt_demo.wat
+@@ -0,0 +1,57 @@
++(module
++  (import "env" "log0" (func $log0 (param i32)))
++  (import "env" "log1" (func $log1 (param i32)))
++  (import "env" "log2" (func $log2 (param i32)))
++  (import "env" "sleep_ms" (func $sleep_ms (param i32)))
++
++  (memory (export "memory") 1)
++
++  (func (export "thread0")
++    (local $i i32)
++    (loop $loop
++      local.get $i
++      call $log0
++
++      local.get $i
++      i32.const 1
++      i32.add
++      local.set $i
++
++      ;; slow down a bit so interleaving is easy to see
++      i32.const 50
++      call $sleep_ms
++
++      br $loop
++    )
++  )
++
++  (func (export "thread1")
++    (local $i i32)
++    (loop $loop
++      local.get $i
++      call $log1
++      local.get $i
++      i32.const 1
++      i32.add
++      local.set $i
++      i32.const 50
++      call $sleep_ms
++      br $loop
++    )
++  )
++
++  (func (export "thread2")
++    (local $i i32)
++    (loop $loop
++      local.get $i
++      call $log2
++      local.get $i
++      i32.const 1
++      i32.add
++      local.set $i
++      i32.const 50
++      call $sleep_ms
++      br $loop
++    )
++  )
++)
+diff --git a/examples/preempt_dot.wat b/examples/preempt_dot.wat
+new file mode 100644
+index 000000000..04a8cfb37
+--- /dev/null
++++ b/examples/preempt_dot.wat
+@@ -0,0 +1,139 @@
++(module
++  (import "env" "sleep_ms" (func $sleep_ms (param i32)))
++
++  ;; Reserve enough space for 3 x 1024x1024 f64 matrices (~24 MiB). 512 pages = 32 MiB.
++  (memory (export "memory") 512)
++
++  ;; Matrix multiply: C = A * B (row-major f64).
++  (func $matmul_f64
++    (param $ptr_a i32) (param $ptr_b i32) (param $ptr_c i32)
++    (param $rows_a i32) (param $cols_a i32) (param $cols_b i32)
++
++    (local $i i32)
++    (local $j i32)
++    (local $k i32)
++    (local $idx i32)
++    (local $offset_a i32)
++    (local $offset_b i32)
++    (local $sum f64)
++
++    (local.set $i (i32.const 0))
++
++    (block $outer_break
++      (loop $outer
++        (br_if $outer_break
++          (i32.ge_u (local.get $i) (local.get $rows_a))
++        )
++
++        (local.set $j (i32.const 0))
++
++        (block $mid_break
++          (loop $mid
++            (br_if $mid_break
++              (i32.ge_u (local.get $j) (local.get $cols_b))
++            )
++
++            (local.set $sum (f64.const 0))
++            (local.set $k (i32.const 0))
++
++            (block $inner_break
++              (loop $inner
++                (br_if $inner_break
++                  (i32.ge_u (local.get $k) (local.get $cols_a))
++                )
++
++                ;; A index: (i * cols_a + k)
++                (local.set $idx
++                  (i32.add
++                    (i32.mul (local.get $i) (local.get $cols_a))
++                    (local.get $k)
++                  )
++                )
++                (local.set $offset_a
++                  (i32.add
++                    (local.get $ptr_a)
++                    (i32.mul (local.get $idx) (i32.const 8))
++                  )
++                )
++
++                ;; B index: (k * cols_b + j)
++                (local.set $idx
++                  (i32.add
++                    (i32.mul (local.get $k) (local.get $cols_b))
++                    (local.get $j)
++                  )
++                )
++                (local.set $offset_b
++                  (i32.add
++                    (local.get $ptr_b)
++                    (i32.mul (local.get $idx) (i32.const 8))
++                  )
++                )
++
++                (local.set $sum
++                  (f64.add
++                    (local.get $sum)
++                    (f64.mul
++                      (f64.load (local.get $offset_a))
++                      (f64.load (local.get $offset_b))
++                    )
++                  )
++                )
++
++                (local.set $k
++                  (i32.add (local.get $k) (i32.const 1))
++                )
++                (br $inner)
++              )
++            )
++
++            ;; C index: (i * cols_b + j)
++            (local.set $idx
++              (i32.add
++                (i32.mul (local.get $i) (local.get $cols_b))
++                (local.get $j)
++              )
++            )
++            (f64.store
++              (i32.add
++                (local.get $ptr_c)
++                (i32.mul (local.get $idx) (i32.const 8))
++              )
++              (local.get $sum)
++            )
++
++            (local.set $j
++              (i32.add (local.get $j) (i32.const 1))
++            )
++            (br $mid)
++          )
++        )
++
++        (local.set $i
++          (i32.add (local.get $i) (i32.const 1))
++        )
++        (br $outer)
++      )
++    )
++  )
++
++  ;; Looping entrypoint to keep preemption exercised.
++  (func (export "matmul_loop")
++    (param $ptr_a i32) (param $ptr_b i32) (param $ptr_c i32)
++    (param $rows_a i32) (param $cols_a i32) (param $cols_b i32)
++    (loop $loop
++      (call $matmul_f64
++        (local.get $ptr_a) (local.get $ptr_b) (local.get $ptr_c)
++        (local.get $rows_a) (local.get $cols_a) (local.get $cols_b))
++      (br $loop)
++    )
++  )
++
++  ;; A simple loop that sleeps for the given milliseconds each iteration.
++  (func (export "sleep_loop") (param $ms i32)
++    (loop $loop
++      (call $sleep_ms (local.get $ms))
++      (br $loop)
++    )
++  )
++)
+diff --git a/examples/preempt_dot_demo.rs b/examples/preempt_dot_demo.rs
+new file mode 100644
+index 000000000..b96d7ef5f
+--- /dev/null
++++ b/examples/preempt_dot_demo.rs
+@@ -0,0 +1,179 @@
++//! Preemptive scheduling demo using a 1024x1024 f64 matrix multiply loop plus
++//! a sleeping companion loop. Exercises argument passing with multiple params.
++//!
++//! Usage:
++//!   cargo run --example preempt_dot_demo           # fuel mode
++//!   cargo run --example preempt_dot_demo epoch     # epoch mode
++
++use anyhow::{ensure, Result};
++use futures::executor::block_on;
++use std::time::Duration;
++use wasmtime::{
++    Caller, Config, Engine, Linker, Memory, PreemptiveMode, Store, WasmThreadHandle,
++};
++
++struct HostState;
++
++fn main() -> Result<()> {
++    let mode = match std::env::args().nth(1).as_deref() {
++        Some("epoch") => PreemptiveMode::Epoch,
++        _ => PreemptiveMode::Fuel,
++    };
++
++    let mut config = Config::new();
++    config.async_support(true);
++    config.wasm_threads(true);
++    config.wasm_stack_switching(true);
++    config.wasm_preemptive_threads_mode(mode);
++    match mode {
++        PreemptiveMode::Fuel => {
++            config.consume_fuel(true);
++            config.epoch_interruption(false);
++        }
++        PreemptiveMode::Epoch => {
++            config.consume_fuel(false);
++            config.epoch_interruption(true);
++        }
++    }
++    config.wasm_preemptive_threads(true);
++
++    let engine = Engine::new(&config)?;
++    let wat_src = include_str!("preempt_dot.wat");
++    let wasm = wat::parse_str(wat_src)?;
++    let module = wasmtime::Module::new(&engine, &wasm)?;
++
++    let mut linker = Linker::new(&engine);
++    linker.func_wrap("env", "sleep_ms", |_: Caller<'_, HostState>, ms: i32| {
++        if ms > 0 {
++            std::thread::sleep(Duration::from_millis(ms as u64));
++        }
++    })?;
++    let mut store = Store::new(&engine, HostState);
++    let instance = block_on(linker.instantiate_async(&mut store, &module))?;
++
++    let memory = instance
++        .get_memory(&mut store, "memory")
++        .expect("memory export");
++    let n = 1024usize;
++
++    // Layout: [A][B][C], each n x n f64.
++    let ptr_a = 0u32;
++    let bytes_mat = (n * n * 8) as u32;
++    let ptr_b = ptr_a + bytes_mat;
++    let ptr_c = ptr_b + bytes_mat;
++
++    write_matrix(&mut store, &memory, ptr_a, n, |i, j| (i + j) as f64)?;
++    write_matrix(&mut store, &memory, ptr_b, n, |i, j| if i == j { 1.0 } else { 0.0 })?;
++    zero_region(&mut store, &memory, ptr_c, bytes_mat)?;
++
++    let matmul_loop = instance.get_typed_func::<(i32, i32, i32, i32, i32, i32), ()>(
++        &mut store,
++        "matmul_loop",
++    )?;
++
++    let _matmul_thread: WasmThreadHandle = store.spawn_wasm_thread(&instance, "matmul_loop", (
++        ptr_a as i32,
++        ptr_b as i32,
++        ptr_c as i32,
++        n as i32,
++        n as i32,
++        n as i32,
++    ))?;
++    let _sleep_thread: WasmThreadHandle =
++        store.spawn_wasm_thread(&instance, "sleep_loop", (5_i32,))?;
++
++    // Keep the typed func alive for type checking.
++    drop(matmul_loop);
++
++    store.run_wasm_threads_for(Duration::from_secs(6))?;
++    store.shutdown_wasm_threads()?;
++
++    // B is identity so C should equal A.
++    let samples = [(0usize, 0usize), (5usize, 7usize), (123usize, 321usize)];
++    println!(
++        "Inputs: A[i,j]=i+j, B=identity (n={}). Expect C == A.",
++        n
++    );
++    for &(i, j) in &samples {
++        let (expected, got, a_val) = sample_entry(&mut store, &memory, ptr_a, ptr_c, n, i, j)?;
++        println!(
++            "C[{i},{j}] = {got:.1} (expected {expected:.1}), A[{i},{j}] = {a_val:.1}"
++        );
++    }
++
++    println!(
++        "mode={:?} matmul n={} (sleep loop active) samples: {:?}",
++        mode, n, samples
++    );
++
++    Ok(())
++}
++
++fn write_matrix(
++    store: &mut Store<HostState>,
++    memory: &Memory,
++    base: u32,
++    n: usize,
++    mut f: impl FnMut(usize, usize) -> f64,
++) -> Result<()> {
++    let mut offset = base as usize;
++    for i in 0..n {
++        for j in 0..n {
++            memory.write(&mut *store, offset, &f(i, j).to_le_bytes())?;
++            offset += 8;
++        }
++    }
++    Ok(())
++}
++
++fn zero_region(store: &mut Store<HostState>, memory: &Memory, base: u32, bytes: u32) -> Result<()> {
++    let zeroes = vec![0u8; bytes as usize];
++    memory.write(&mut *store, base as usize, &zeroes)?;
++    Ok(())
++}
++
++fn read_entry(
++    store: &mut Store<HostState>,
++    memory: &Memory,
++    base: u32,
++    n: usize,
++    i: usize,
++    j: usize,
++) -> Result<f64> {
++    let idx = i * n + j;
++    let addr = base as usize + idx * 8;
++    let mut buf = [0u8; 8];
++    memory.read(store, addr, &mut buf)?;
++    Ok(f64::from_le_bytes(buf))
++}
++
++fn sample_entry(
++    store: &mut Store<HostState>,
++    memory: &Memory,
++    ptr_a: u32,
++    ptr_c: u32,
++    n: usize,
++    i: usize,
++    j: usize,
++) -> Result<(f64, f64, f64)> {
++    let expected = (i + j) as f64;
++    let got = read_entry(store, memory, ptr_c, n, i, j)?;
++    let a_val = read_entry(store, memory, ptr_a, n, i, j)?;
++    ensure!(
++        (got - expected).abs() < 1e-6,
++        "matmul mismatch at ({}, {}): got {}, expected {}",
++        i,
++        j,
++        got,
++        expected
++    );
++    ensure!(
++        (a_val - expected).abs() < 1e-6,
++        "input A corrupted at ({}, {}): got {}, expected {}",
++        i,
++        j,
++        a_val,
++        expected
++    );
++    Ok((expected, got, a_val))
++}
+
+</gitdiff.diff>
+<conversation>
+Blek
+
+ — 4:17 AM
+https://github.com/bytecodealliance/wasmtime/issues/4109 <- mentions the fuel overhead being at 24-34% overhead (from 3 years ago but open issue) and says that there's not a slacked fuel implementation 
+
+roman volosatovs did not make fuel edits to wasmtime from what i can see (works at cosmonic and is the guy we had previously mentioned) https://github.com/bytecodealliance/wasmtime/commits?author=rvolosatovs
+he did stuff with wasi API or whatever else but no fuel from what i see
+
+
+i actually can't find anyone at cosmonic that worked on fuel unless 
+
+the actual fuel/epoch people i found were:
+
+tyler rockwood: commit 85c0a2df5, he went from multiple counters to single counter + reserve for the fuel API (started the reserve/injection stuff) and made the fuel_async_yield_interval work as a cap on refueling. didnt do fuel optimization but just simpliefied the fuel APIshttps://github.com/bytecodealliance/wasmtime/commit/85c0a2df5
+
+jamey sharp: worked on async yielding from epoch interruption callbacks but it's just for epoch stuff, not fuel (let there be epoch callbacks to yield to async executor) https://github.com/bytecodealliance/wasmtime/commit/1d4686de5
+
+paul osborne (@fastly) did custom yield behavior for epoch interruptshttps://github.com/bytecodealliance/wasmtime/commit/63df06b (also in issue #10671 https://github.com/bytecodealliance/wasmtime/pull/10671
+
+I dont see wasmcloud's performance or their use of using fuel anywhere (closest thing was HTTP fuel consumption but that's not really anything https://github.com/wasmCloud/wasmCloud/pull/2980
+
+
+etc resources on fuel but this isnt really what you're asking about:
+https://agryaznov.com/posts/wasm-gas-metering/ 
+i need to go bed for now but can work on this after the final tomorrow
+(mostly on the report stuff
+Jerry Yang — 4:44 AM
+That's so great, I will work on the implementation part today after final
+Blek
+
+ — 3:42 PM
+Im going to probably take a nap then study for my next final/work on the report. Please let me know if you make any changes to it as i dont want to conflict with anything youre doing
+Let me know what else you need from me
+Jerry Yang — 3:43 PM
+No problem, I am setting up my new machine at the moment (previously the EC2 ran out of credits). I will keep you updated.
+Jerry Yang — 6:31 PM
+i am a bit sleepy, i will probably sleep for 2-3 hours and work throughout the night, hopefully the implementation part can be mostly done
+Jerry Yang — 12:13 AM
+As a further investigation on top of the above links, we can see the super promising result of 'potentially' our 'current' implementation, that's to say, use fuel-based approach for metering and use epoch for interrupt can have really good performance gain compared to the vanilla fuel.
+
+I will rethink about next step implementation (what to achieve, i will need to do some reasoning and communicate with LLM to decide), but I should be able to finish it before noon.
+Blek
+
+ — 12:13 AM
+ok sounds good
+i plan on staying up and working on the report/studying until im done (i will be up until about 6-7 probably) and sleep until my final at 3 pm basically 
+
+so i will be unable to make further changes to report based on any new implementations that you do if it's around noon
+Jerry Yang — 12:16 AM
+no need to worry about that, i think LLM should be sufficient in sense of completing the report, as long as we have a complete 4 hours to write it, it's enough to polish and remove the LLM-like phrases.
+Blek
+
+ — 12:17 AM
+er like my final tmrw is 3 pm to 6 pm
+to make that super clear
+Jerry Yang — 12:22 AM
+ahh, i see , no worries, you can focus on your final. The investigation you have done is already super helpful (all i need to do is just to read through those links and then jump directly to implementation)
+Jerry Yang — 1:43 AM
+In a more recent changes by roman volosatovs , the performance of their load test has proved to be improved significantly, relevant issues/PRs:
+
+https://github.com/near/nearcore/pull/13743
+https://github.com/near/nearcore/pull/14248
+https://github.com/near/nearcore/issues/13791
+
+He did this work when he was working for NEAR. I will try to make the benchmark running to replicate the result.
+GitHub
+chore: update Wasmtime to 34 by rvolosatovs · Pull Request #13743 ...
+This PR exists mostly to pull in bytecodealliance/wasmtime#11068 (see profiles linked in that PR). If it lands in the upcoming Wasmtime 34.0.0 release (bytecodealliance/wasmtime#11074), then this P...
+GitHub
+feat: instrument modules inline by rvolosatovs · Pull Request #142...
+Depends on near/finite-wasm#80 (moved here)
+Closes #13791
+Benchmarks using mainnet data, protocol version 79
+NearVm (Wasmer, outdated):
+
+Applied the chunk 915 times. - average stats: (application t...
+Depends on near/finite-wasm#80 (moved here)
+Closes #13791
+Benchmarks using mainnet data, protocol version 79
+NearVm (Wasmer, outdated):
+
+Applied the chunk 915 times. - average stats: (application t...
+GitHub
+Ensure Wasmtime VM performance matches Wasmer VM · Issue #13791 ·...
+Current benchmarks: Wasmer: 434/434 blocks applied in 60s at a rate of 7.1799/s Wasmtime: 142/142 blocks applied in 53s at a rate of 2.7055/s (from #13775) Using neard view-state apply-range --stor...
+Ensure Wasmtime VM performance matches Wasmer VM · Issue #13791 ·...
+At this point, I think I have found the EXACT imporvement mentioned by deian. This will be a good story to talk in the paper, but before that, we need to have the benchmark running. And I will do that once I have done my other investigation.
+Jerry Yang — 2:47 AM
+okay, the timeline is clearer, the 10% overhead on the documentation is up-to-date. Original the fuel-based approach has overhead of > 30%, now is just 10% after rvolosatovs's code change.
+
+And according to pepyakin's experiments, even with the original fuel-based metering, if they go with hybrid approach, the overhead is minimal (<10%). I think our experiments are needed to present this flow clearly. This should answer deian's concern and I think it is good for grading. Basically in the paper, we will talk about two stories:
+
+the story of wasmtime's threading (old behavior, cooperative threading, then our preemptive threading)
+the story of wasmtime interruption (old fuel-based approach and the insight from pepyakin's hybrid approach to have almost zero overhead, which we actually implemened by accident, then the improvement by Cosmonic rvolosatovs's work when working for NEAR blockchain, with great improvement to the fuel approach, we can the discuss a bit on their methodology of fuel-metering but i guess we won't have that much space)
+
+The entire flow is pretty I think, and we would have more than enough reference.
+
+I will step into the code rewrite after the benchmarking completed. 
+Jerry Yang — 3:58 AM
+I just get the benchmark for fuel/epoch, the overhead is not 10% but 20% on this machine. I will just report this as it is. I won't work on the benchmark of rvolosatovs's unless i have finished the code rewrite.
+
+I need to sleep for a few hours (2-3) and will continue.
+Blek
+
+ — 7:11 AM
+i have to go to sleep unfortunately 
+i put down another page or so but still just kinda looking at how things were working and how to structure now
+
+i got llm to do the rest and restrcuture a bit differently so maybe just cutting down on that (i basically did the first 3 pages myself tho 
+
+sorry i was not able to completely finish this. i need to sleep before my final 
+Attachment file type: unknown
+report_2.typ
+31.67 KB
+Jerry Yang — 10:45 AM
+Cool, no problem, working on the rewrite. And I got some decent numbers, if you have time (or I have time after the implementation and report writing), i would suggest reading through the following link and try to replicate their fuel benchmarking result.
+        
+NEAR core: https://github.com/near/nearcore/pull/14248
+NEAR core: https://github.com/near/nearcore/issues/13791
+this PR makes Wasmtime performance nearly identical to NearVm in locust load test https://github.com/near/nearcore/pull/13775
+https://github.com/near/nearcore/pull/13743
+ 
+What I got:
+
+Dot Product:
+baseline        mean =   37.543 ms  stddev =  0.338  overhead_mean = x1.000  overhead_std = x0.009
+fuel            mean =   55.691 ms  stddev =  0.152  overhead_mean = x1.483  overhead_std = x0.004
+epoch           mean =   55.838 ms  stddev =  0.196  overhead_mean = x1.487  overhead_std = x0.005
+fast_baseline   mean =   37.758 ms  stddev =  0.223  overhead_mean = x1.000  overhead_std = x0.006
+fast_fuel       mean =   55.364 ms  stddev =  0.174  overhead_mean = x1.466  overhead_std = x0.005
+fast_epoch      mean =   55.841 ms  stddev =  0.493  overhead_mean = x1.479  overhead_std = x0.013
+
+
+Matmul:
+baseline        mean =  417.007 ms  stddev =  4.077  overhead_mean = x1.000  overhead_std = x0.010
+fuel            mean =  520.691 ms  stddev =  3.423  overhead_mean = x1.249  overhead_std = x0.008
+epoch           mean =  630.010 ms  stddev = 10.647  overhead_mean = x1.511  overhead_std = x0.026
+fast_baseline   mean =  432.639 ms  stddev =  6.536  overhead_mean = x1.000  overhead_std = x0.015
+fast_fuel       mean =  533.059 ms  stddev =  7.093  overhead_mean = x1.232  overhead_std = x0.016
+fast_epoch      mean =  629.153 ms  stddev =  8.675  overhead_mean = x1.454  overhead_std = x0.020
+
+
+Fib (likely what they measured for their 10% epoch overhead claim and higher overhead of fuel):
+baseline        mean =   36.554 ms  stddev =  0.210  overhead_mean = x1.000  overhead_std = x0.006
+fuel            mean =   43.519 ms  stddev =  0.185  overhead_mean = x1.191  overhead_std = x0.005
+epoch           mean =   35.404 ms  stddev =  0.044  overhead_mean = x0.969  overhead_std = x0.001
+fast_baseline   mean =   36.424 ms  stddev =  0.142  overhead_mean = x1.000  overhead_std = x0.004
+fast_fuel       mean =   43.616 ms  stddev =  0.243  overhead_mean = x1.197  overhead_std = x0.007
+fast_epoch      mean =   35.567 ms  stddev =  0.153  overhead_mean = x0.976  overhead_std = x0.004
+
+So basically the actual overhead really depends on the type of workloads. And these three happens to be:
+
+- both perform similarly
+- fuel performs better
+- epoch performs better
+
+THerefore supporting both approach and allow users to select is important.
+Blek
+
+ — 1:28 PM
+i wont have time to replicate it but i'll read through
+between 6-7, are you free to meet and work on the presentation/get ready for that ?
+Jerry Yang — 1:38 PM
+yeah sure
+Jerry Yang — 2:54 PM
+I am correcting some mistakes in the report, and will submit the final version before 5 PM to the slack channel.
+
+</conversation>
+<results>
+# `bench-runner`
+
+## Directory `/`
+
+```sh
+|-- .git/
+|-- docs/
+|-- examples/
+|-- src/
+|-- .gitignore    [text]
+`-- Cargo.toml    [text]
+```
+
+### Directory `.git/`
+
+```sh
+```
+
+### Directory `examples/`
+
+```sh
+|-- dot.wat    [text]
+|-- fib.wat    [text]
+`-- matmul.wat    [text]
+```
+
+### Source file: `examples/fib.wat`
+
+```wat
+(module
+  (func $fibonacci (param $n i32) (result i32)
+    (if
+      (i32.lt_s (local.get $n) (i32.const 2))
+      (then (return (local.get $n)))
+    )
+    (i32.add
+      (call $fibonacci (i32.sub (local.get $n) (i32.const 1)))
+      (call $fibonacci (i32.sub (local.get $n) (i32.const 2)))
+    )
+  )
+  (export "fibonacci" (func $fibonacci))
+)
+
+```
+
+### Source file: `examples/dot.wat`
+
+```wat
+(module
+  ;; expose memory so host can pass vectors in
+  (memory (export "memory") 8192)
+
+  ;; --------------------------------
+  ;; dot product: f64
+  ;;
+  ;; params:
+  ;;   ptr_a : i32  - base address of vector A (f64[])
+  ;;   ptr_b : i32  - base address of vector B (f64[])
+  ;;   len   : i32  - number of elements
+  ;;
+  ;; returns:
+  ;;   f64 dot product
+  ;; --------------------------------
+  (func $dot_f64 (param $ptr_a i32) (param $ptr_b i32) (param $len i32) (result f64)
+    (local $i i32)
+    (local $sum f64)
+    (local $offset_a i32)
+    (local $offset_b i32)
+
+    (local.set $i (i32.const 0))
+    (local.set $sum (f64.const 0))
+
+    (block $break
+      (loop $loop
+        (br_if $break
+          (i32.ge_u (local.get $i) (local.get $len))
+        )
+
+        (local.set $offset_a
+          (i32.add
+            (local.get $ptr_a)
+            (i32.mul (local.get $i) (i32.const 8))
+          )
+        )
+        (local.set $offset_b
+          (i32.add
+            (local.get $ptr_b)
+            (i32.mul (local.get $i) (i32.const 8))
+          )
+        )
+
+        (local.set $sum
+          (f64.add
+            (local.get $sum)
+            (f64.mul
+              (f64.load (local.get $offset_a))
+              (f64.load (local.get $offset_b))
+            )
+          )
+        )
+
+        (local.set $i
+          (i32.add (local.get $i) (i32.const 1))
+        )
+        (br $loop)
+      )
+    )
+
+    (local.get $sum)
+  )
+
+  (export "dot_f64" (func $dot_f64))
+)
+
+```
+
+### Source file: `examples/matmul.wat`
+
+```wat
+(module
+  ;; expose memory so host can pass matrices in
+  (memory (export "memory") 512)
+
+  ;; --------------------------------
+  ;; matrix multiply: f64
+  ;;
+  ;; C = A * B
+  ;;
+  ;; params:
+  ;;   ptr_a   : i32  - base address of A (rows_a x cols_a)
+  ;;   ptr_b   : i32  - base address of B (cols_a x cols_b)
+  ;;   ptr_c   : i32  - base address of C (rows_a x cols_b)
+  ;;   rows_a  : i32
+  ;;   cols_a  : i32
+  ;;   cols_b  : i32
+  ;;
+  ;; all matrices are row-major, elements are f64
+  ;; --------------------------------
+  (func $mat_mul_f64
+    (param $ptr_a i32) (param $ptr_b i32) (param $ptr_c i32)
+    (param $rows_a i32) (param $cols_a i32) (param $cols_b i32)
+
+    (local $i i32)
+    (local $j i32)
+    (local $k i32)
+    (local $idx i32)
+    (local $offset_a i32)
+    (local $offset_b i32)
+    (local $sum f64)
+
+    (local.set $i (i32.const 0))
+
+    (block $outer_break
+      (loop $outer
+        (br_if $outer_break
+          (i32.ge_u (local.get $i) (local.get $rows_a))
+        )
+
+        (local.set $j (i32.const 0))
+
+        (block $mid_break
+          (loop $mid
+            (br_if $mid_break
+              (i32.ge_u (local.get $j) (local.get $cols_b))
+            )
+
+            (local.set $sum (f64.const 0))
+            (local.set $k (i32.const 0))
+
+            (block $inner_break
+              (loop $inner
+                (br_if $inner_break
+                  (i32.ge_u (local.get $k) (local.get $cols_a))
+                )
+
+                ;; A index: (i * cols_a + k)
+                (local.set $idx
+                  (i32.add
+                    (i32.mul (local.get $i) (local.get $cols_a))
+                    (local.get $k)
+                  )
+                )
+                (local.set $offset_a
+                  (i32.add
+                    (local.get $ptr_a)
+                    (i32.mul (local.get $idx) (i32.const 8))
+                  )
+                )
+
+                ;; B index: (k * cols_b + j)
+                (local.set $idx
+                  (i32.add
+                    (i32.mul (local.get $k) (local.get $cols_b))
+                    (local.get $j)
+                  )
+                )
+                (local.set $offset_b
+                  (i32.add
+                    (local.get $ptr_b)
+                    (i32.mul (local.get $idx) (i32.const 8))
+                  )
+                )
+
+                (local.set $sum
+                  (f64.add
+                    (local.get $sum)
+                    (f64.mul
+                      (f64.load (local.get $offset_a))
+                      (f64.load (local.get $offset_b))
+                    )
+                  )
+                )
+
+                (local.set $k
+                  (i32.add (local.get $k) (i32.const 1))
+                )
+                (br $inner)
+              )
+            )
+
+            ;; C index: (i * cols_b + j)
+            (local.set $idx
+              (i32.add
+                (i32.mul (local.get $i) (local.get $cols_b))
+                (local.get $j)
+              )
+            )
+            (f64.store
+              (i32.add
+                (local.get $ptr_c)
+                (i32.mul (local.get $idx) (i32.const 8))
+              )
+              (local.get $sum)
+            )
+
+            (local.set $j
+              (i32.add (local.get $j) (i32.const 1))
+            )
+            (br $mid)
+          )
+        )
+
+        (local.set $i
+          (i32.add (local.get $i) (i32.const 1))
+        )
+        (br $outer)
+      )
+    )
+  )
+
+  (export "matmul_f64" (func $mat_mul_f64))
+)
+
+```
+
+### Directory `src/`
+
+```sh
+`-- main.rs    [text]
+```
+
+### Source file: `src/main.rs`
+
+```rust
+use anyhow::{anyhow, bail, Result};
+use std::time::{Duration, Instant};
+use std::{env, fs};
+use wasmtime::{Config, Engine, Instance, Module, Store, Strategy};
+
+const RUNS: usize = 15;
+const DROP: usize = 5;
+const DEFAULT_ITERS: u32 = 50;
+const DEFAULT_ARG: i32 = 32;
+const DOT_LEN: usize = 4096 * 4096;
+const MATMUL_ROWS: usize = 512;
+const MATMUL_COLS: usize = 512;
+const MATMUL_OUT_COLS: usize = 512;
+const HEAVY_ITERS: u32 = 25;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkloadKind {
+    Fibonacci { n: i32 },
+    DotF64 { len: usize },
+    MatMulF64 {
+        rows_a: usize,
+        cols_a: usize,
+        cols_b: usize,
+    },
+}
+
+struct Workload {
+    name: String,
+    wat_src: String,
+    export: &'static str,
+    iters: u32,
+    kind: WorkloadKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExperimentKind {
+    Baseline,
+    Fuel,
+    Epoch,
+    FastBaseline,
+    FastFuel,
+    FastEpoch,
+}
+
+struct Experiment {
+    name: &'static str,
+    kind: ExperimentKind,
+}
+
+const EXPERIMENTS: &[Experiment] = &[
+    Experiment {
+        name: "baseline",
+        kind: ExperimentKind::Baseline,
+    },
+    Experiment {
+        name: "fuel",
+        kind: ExperimentKind::Fuel,
+    },
+    Experiment {
+        name: "epoch",
+        kind: ExperimentKind::Epoch,
+    },
+    Experiment {
+        name: "fast_baseline",
+        kind: ExperimentKind::FastBaseline,
+    },
+    Experiment {
+        name: "fast_fuel",
+        kind: ExperimentKind::FastFuel,
+    },
+    Experiment {
+        name: "fast_epoch",
+        kind: ExperimentKind::FastEpoch,
+    },
+];
+
+fn make_config(kind: ExperimentKind) -> Config {
+    let mut cfg = Config::new();
+    let fast = matches!(
+        kind,
+        ExperimentKind::FastBaseline | ExperimentKind::FastFuel | ExperimentKind::FastEpoch
+    );
+    if fast {
+        cfg.strategy(Strategy::Cranelift);
+        cfg.signals_based_traps(true);
+        cfg.memory_reservation(1u64 << 32);
+        cfg.memory_guard_size(1u64 << 32);
+    }
+    if matches!(kind, ExperimentKind::Fuel | ExperimentKind::FastFuel) {
+        cfg.consume_fuel(true);
+    }
+    if matches!(kind, ExperimentKind::Epoch | ExperimentKind::FastEpoch) {
+        cfg.epoch_interruption(true);
+    }
+    cfg
+}
+
+fn load_workload_from_cli() -> Result<Workload> {
+    let mut args = env::args().skip(1);
+    let name = match args.next() {
+        Some(n) => n,
+        None => bail!("usage: cargo run --release -- <example_name>"),
+    };
+
+    match name.as_str() {
+        "fib" | "fibonacci" => Ok(Workload {
+            name,
+            wat_src: fs::read_to_string("examples/fib.wat")?,
+            export: "fibonacci",
+            iters: DEFAULT_ITERS,
+            kind: WorkloadKind::Fibonacci { n: DEFAULT_ARG },
+        }),
+        "dot" => Ok(Workload {
+            name,
+            wat_src: fs::read_to_string("examples/dot.wat")?,
+            export: "dot_f64",
+            iters: DEFAULT_ITERS,
+            kind: WorkloadKind::DotF64 { len: DOT_LEN },
+        }),
+        "matmul" => Ok(Workload {
+            name,
+            wat_src: fs::read_to_string("examples/matmul.wat")?,
+            export: "matmul_f64",
+            iters: HEAVY_ITERS,
+            kind: WorkloadKind::MatMulF64 {
+                rows_a: MATMUL_ROWS,
+                cols_a: MATMUL_COLS,
+                cols_b: MATMUL_OUT_COLS,
+            },
+        }),
+        _ => bail!("unknown workload: {}", name),
+    }
+}
+
+
+fn compile_module(engine: &Engine, workload: &Workload) -> Result<Module> {
+    Ok(Module::new(engine, workload.wat_src.as_str())?)
+}
+
+fn write_f64_le(memory: &mut [u8], offset: usize, value: f64) {
+    memory[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn run_workload_once(
+    mut store: Store<()>,
+    module: Module,
+    workload: &Workload,
+) -> Result<Duration> {
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let iters = workload.iters;
+
+    let start = Instant::now();
+
+    match workload.kind {
+        WorkloadKind::Fibonacci { n } => {
+            let func = instance.get_typed_func::<i32, i32>(&mut store, workload.export)?;
+            for _ in 0..iters {
+                let _ = func.call(&mut store, n)?;
+            }
+        }
+        WorkloadKind::DotF64 { len } => {
+            let func =
+                instance.get_typed_func::<(i32, i32, i32), f64>(&mut store, workload.export)?;
+            let Some(memory) = instance.get_memory(&mut store, "memory") else {
+                bail!("workload {} does not export memory", workload.name);
+            };
+
+            let mut data = memory.data_mut(&mut store);
+            let Some(bytes_per_vec) = len.checked_mul(8) else {
+                bail!("dot workload length too large");
+            };
+            let base_a = 0usize;
+            let base_b = bytes_per_vec;
+            let total_bytes = base_b + bytes_per_vec;
+            if total_bytes > data.len() {
+                bail!(
+                    "memory ({}) too small for dot workload needing {} bytes",
+                    data.len(),
+                    total_bytes
+                );
+            }
+
+            for i in 0..len {
+                write_f64_le(&mut data, base_a + i * 8, (i as f64) + 1.0);
+                write_f64_le(&mut data, base_b + i * 8, (len as f64) - (i as f64));
+            }
+
+            let ptr_a = base_a as i32;
+            let ptr_b = base_b as i32;
+            let len_i32 = len as i32;
+            for _ in 0..iters {
+                let _ = func.call(&mut store, (ptr_a, ptr_b, len_i32))?;
+            }
+        }
+        WorkloadKind::MatMulF64 {
+            rows_a,
+            cols_a,
+            cols_b,
+        } => {
+            let func = instance.get_typed_func::<(i32, i32, i32, i32, i32, i32), ()>(
+                &mut store,
+                workload.export,
+            )?;
+            let Some(memory) = instance.get_memory(&mut store, "memory") else {
+                bail!("workload {} does not export memory", workload.name);
+            };
+
+            let a_elems = rows_a * cols_a;
+            let b_elems = cols_a * cols_b;
+            let c_elems = rows_a * cols_b;
+
+            let a_bytes = a_elems
+                .checked_mul(8)
+                .ok_or_else(|| anyhow!("matmul A size overflow"))?;
+            let b_bytes = b_elems
+                .checked_mul(8)
+                .ok_or_else(|| anyhow!("matmul B size overflow"))?;
+            let c_bytes = c_elems
+                .checked_mul(8)
+                .ok_or_else(|| anyhow!("matmul C size overflow"))?;
+
+            let base_a = 0usize;
+            let base_b = a_bytes;
+            let base_c = base_b
+                .checked_add(b_bytes)
+                .ok_or_else(|| anyhow!("matmul offsets overflow"))?;
+            let total_bytes = base_c
+                .checked_add(c_bytes)
+                .ok_or_else(|| anyhow!("matmul total size overflow"))?;
+
+            let mut data = memory.data_mut(&mut store);
+            if total_bytes > data.len() {
+                bail!(
+                    "memory ({}) too small for matmul workload needing {} bytes",
+                    data.len(),
+                    total_bytes
+                );
+            }
+
+            for i in 0..rows_a {
+                for j in 0..cols_a {
+                    let idx = i * cols_a + j;
+                    write_f64_le(&mut data, base_a + idx * 8, (idx % 23) as f64 + 1.0);
+                }
+            }
+
+            for i in 0..cols_a {
+                for j in 0..cols_b {
+                    let idx = i * cols_b + j;
+                    write_f64_le(
+                        &mut data,
+                        base_b + idx * 8,
+                        (1 + (idx % 13)) as f64 * 0.5,
+                    );
+                }
+            }
+
+            for idx in 0..c_elems {
+                write_f64_le(&mut data, base_c + idx * 8, 0.0);
+            }
+
+            let ptr_a = base_a as i32;
+            let ptr_b = base_b as i32;
+            let ptr_c = base_c as i32;
+
+            for _ in 0..iters {
+                func.call(
+                    &mut store,
+                    (
+                        ptr_a,
+                        ptr_b,
+                        ptr_c,
+                        rows_a as i32,
+                        cols_a as i32,
+                        cols_b as i32,
+                    ),
+                )?;
+            }
+        }
+    }
+
+    Ok(start.elapsed())
+}
+
+fn run_experiment_once(workload: &Workload, exp: &Experiment) -> Result<f64> {
+    let cfg = make_config(exp.kind);
+    let engine = Engine::new(&cfg)?;
+    let module = compile_module(&engine, workload)?;
+    let mut store = Store::new(&engine, ());
+    if matches!(exp.kind, ExperimentKind::Fuel | ExperimentKind::FastFuel) {
+        store.set_fuel(u64::MAX / 4)?;
+    }
+    if matches!(exp.kind, ExperimentKind::Epoch | ExperimentKind::FastEpoch) {
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(u64::MAX);
+    }
+    let elapsed = run_workload_once(store, module, workload)?;
+    Ok(elapsed.as_secs_f64() * 1000.0 / (workload.iters as f64))
+}
+
+struct Stats {
+    runs: [f64; RUNS - DROP],
+    mean: f64,
+    stddev: f64,
+}
+
+fn compute_stats_trimmed(samples: &[f64; RUNS]) -> Stats {
+    // copy values so we can sort to compute median
+    let mut sorted_vals = *samples;
+    sorted_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = sorted_vals[sorted_vals.len() / 2];
+
+    // deviation list (tuple of (orig_idx, value, deviation))
+    let mut dev: [(usize, f64, f64); RUNS] = [(0, 0.0, 0.0); RUNS];
+
+    for i in 0..RUNS {
+        let x = samples[i];
+        dev[i] = (i, x, (x - median).abs());
+    }
+
+    // sort by deviation
+    dev.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+
+    // arrays to return
+    let mut runs = [0f64; RUNS - DROP];
+
+    // fill arrays
+    for i in 0..(RUNS - DROP) {
+        runs[i] = dev[i].1;
+    }
+
+    // compute mean
+    let n = (RUNS - DROP) as f64;
+    let mut sum = 0.0;
+    for x in runs.iter() {
+        sum += *x;
+    }
+    let mean = sum / n;
+
+    // compute stddev
+    let stddev = if RUNS - DROP < 2 {
+        0.0
+    } else {
+        let mut var = 0.0;
+        for x in runs.iter() {
+            var += (*x - mean) * (*x - mean);
+        }
+        (var / (n - 1.0)).sqrt()
+    };
+
+    Stats {
+        runs,
+        mean,
+        stddev,
+    }
+}
+
+struct ExperimentResult {
+    exp: &'static Experiment,
+    stats: Stats,
+}
+
+fn main() -> Result<()> {
+    let workload = load_workload_from_cli()?;
+
+    println!(
+        "workload = {}, iters = {}, runs = {}, drop = {}",
+        workload.name, workload.iters, RUNS, DROP
+    );
+    println!();
+
+    let mut results = Vec::new();
+
+    for exp in EXPERIMENTS {
+        println!("experiment: {}", exp.name);
+        let mut samples: [f64; RUNS] = [0.0; RUNS];
+        for i in 0..RUNS {
+            let ms = run_experiment_once(&workload, exp)?;
+            samples[i] = ms;
+            println!("  run {:2}: {:.3} ms", i + 1, ms);
+        }
+        let stats = compute_stats_trimmed(&samples);
+
+        println!("  picked runs:");
+        print!("    [");
+        for (i, val) in stats.runs.iter().enumerate() {
+            if i > 0 {
+                print!(", ");
+            }
+            print!("{:.3}", val);
+        }
+        println!("]");
+
+        println!(
+            "  trimmed mean = {:.3} ms, trimmed stddev = {:.3} ms\n",
+            stats.mean, stats.stddev
+        );
+        results.push(ExperimentResult { exp, stats });
+    }
+
+    let baseline = results
+        .iter()
+        .find(|r| r.exp.kind == ExperimentKind::Baseline)
+        .unwrap()
+        .stats
+        .mean;
+    let fast_base = results
+        .iter()
+        .find(|r| r.exp.kind == ExperimentKind::FastBaseline)
+        .map(|r| r.stats.mean)
+        .unwrap_or(baseline);
+
+    println!("==== summary (trimmed) ====\n");
+
+    for r in &results {
+        let ref_mean = match r.exp.kind {
+            ExperimentKind::Baseline => baseline,
+            ExperimentKind::Fuel | ExperimentKind::Epoch => baseline,
+            ExperimentKind::FastBaseline => fast_base,
+            ExperimentKind::FastFuel | ExperimentKind::FastEpoch => fast_base,
+        };
+        let overhead_mean = r.stats.mean / ref_mean;
+        let overhead_std = r.stats.stddev / ref_mean;
+
+        println!(
+            "{:<15} mean = {:8.3} ms  stddev = {:6.3}  overhead_mean = x{:.3}  overhead_std = x{:.3}",
+            r.exp.name, r.stats.mean, r.stats.stddev, overhead_mean, overhead_std
+        );
+    }
+
+    Ok(())
+}
+
+```
+
+### Source file: `Cargo.toml`
+
+```toml
+[package]
+name = "bench-runner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+criterion = "0.8.1"
+wasmer = "6.1.0"
+wasmer-middlewares = "6.1.0"
+wasmtime = "39.0.1"
+
+```
+
+### Directory `docs/`
+
+```sh
+|-- dot_nightly.txt    [text]
+|-- fib_nightly.txt    [text]
+|-- matmul_nightly.txt    [text]
+|-- nightly.txt    [text]
+`-- stable.txt    [text]
+```
+
+### Source file: `docs/stable.txt`
+
+```txt
+linuxuser@vultr:~/wasm-preempt/fuel-instrument-benchmark/bench-runner$ cargo run --release -- fib
+   Compiling bench-runner v0.1.0 (/home/linuxuser/wasm-preempt/fuel-instrument-benchmark/bench-runner)
+    Finished `release` profile [optimized] target(s) in 2.77s
+     Running `target/release/bench-runner fib`
+workload = fib, iters = 50, runs = 15, drop = 5
+
+experiment: baseline
+  run  1: 36.288 ms
+  run  2: 36.280 ms
+  run  3: 35.295 ms
+  run  4: 35.128 ms
+  run  5: 36.452 ms
+  run  6: 35.050 ms
+  run  7: 34.521 ms
+  run  8: 36.199 ms
+  run  9: 35.437 ms
+  run 10: 35.205 ms
+  run 11: 36.435 ms
+  run 12: 36.220 ms
+  run 13: 36.154 ms
+  run 14: 33.706 ms
+  run 15: 33.968 ms
+  trimmed mean = 35.725 ms, trimmed stddev = 0.541 ms
+
+experiment: fuel
+  run  1: 43.226 ms
+  run  2: 43.193 ms
+  run  3: 43.192 ms
+  run  4: 43.184 ms
+  run  5: 43.248 ms
+  run  6: 43.243 ms
+  run  7: 44.133 ms
+  run  8: 43.227 ms
+  run  9: 43.266 ms
+  run 10: 43.129 ms
+  run 11: 43.033 ms
+  run 12: 43.235 ms
+  run 13: 43.086 ms
+  run 14: 43.370 ms
+  run 15: 43.500 ms
+  trimmed mean = 43.214 ms, trimmed stddev = 0.040 ms
+
+experiment: epoch
+  run  1: 35.202 ms
+  run  2: 35.286 ms
+  run  3: 35.465 ms
+  run  4: 35.197 ms
+  run  5: 35.304 ms
+  run  6: 35.215 ms
+  run  7: 35.348 ms
+  run  8: 35.379 ms
+  run  9: 35.361 ms
+  run 10: 35.286 ms
+  run 11: 35.452 ms
+  run 12: 35.459 ms
+  run 13: 35.352 ms
+  run 14: 35.329 ms
+  run 15: 35.251 ms
+  trimmed mean = 35.311 ms, trimmed stddev = 0.052 ms
+
+experiment: fast_baseline
+  run  1: 36.320 ms
+  run  2: 36.316 ms
+  run  3: 36.267 ms
+  run  4: 36.236 ms
+  run  5: 36.295 ms
+  run  6: 36.114 ms
+  run  7: 35.964 ms
+  run  8: 36.193 ms
+  run  9: 36.173 ms
+  run 10: 36.291 ms
+  run 11: 36.279 ms
+  run 12: 36.429 ms
+  run 13: 36.351 ms
+  run 14: 36.060 ms
+  run 15: 35.617 ms
+  trimmed mean = 36.272 ms, trimmed stddev = 0.057 ms
+
+experiment: fast_fuel
+  run  1: 43.113 ms
+  run  2: 43.141 ms
+  run  3: 43.187 ms
+  run  4: 43.448 ms
+  run  5: 43.729 ms
+  run  6: 43.180 ms
+  run  7: 43.813 ms
+  run  8: 43.110 ms
+  run  9: 43.804 ms
+  run 10: 43.821 ms
+  run 11: 43.494 ms
+  run 12: 43.564 ms
+  run 13: 43.369 ms
+  run 14: 43.192 ms
+  run 15: 43.052 ms
+  trimmed mean = 43.280 ms, trimmed stddev = 0.172 ms
+
+experiment: fast_epoch
+  run  1: 35.161 ms
+  run  2: 35.453 ms
+  run  3: 35.540 ms
+  run  4: 35.157 ms
+  run  5: 35.321 ms
+  run  6: 35.477 ms
+  run  7: 35.363 ms
+  run  8: 35.597 ms
+  run  9: 35.417 ms
+  run 10: 35.270 ms
+  run 11: 35.348 ms
+  run 12: 35.525 ms
+  run 13: 35.363 ms
+  run 14: 35.457 ms
+  run 15: 35.085 ms
+  trimmed mean = 35.400 ms, trimmed stddev = 0.079 ms
+
+==== summary (trimmed) ====
+
+baseline        mean =   35.725 ms  stddev =  0.541  overhead_mean = x1.000  overhead_std = x0.015
+fuel            mean =   43.214 ms  stddev =  0.040  overhead_mean = x1.210  overhead_std = x0.001
+epoch           mean =   35.311 ms  stddev =  0.052  overhead_mean = x0.988  overhead_std = x0.001
+fast_baseline   mean =   36.272 ms  stddev =  0.057  overhead_mean = x1.000  overhead_std = x0.002
+fast_fuel       mean =   43.280 ms  stddev =  0.172  overhead_mean = x1.193  overhead_std = x0.005
+fast_epoch      mean =   35.400 ms  stddev =  0.079  overhead_mean = x0.976  overhead_std = x0.002
+
+```
+
+### Source file: `docs/nightly.txt`
+
+```txt
+linuxuser@vultr:~/wasm-preempt/fuel-instrument-benchmark/bench-runner$ cargo +nightly run --release -- fib
+workload = fib, iters = 50, runs = 15, drop = 5
+
+experiment: baseline
+  run  1: 36.397 ms
+  run  2: 36.243 ms
+  run  3: 36.258 ms
+  run  4: 36.259 ms
+  run  5: 36.207 ms
+  run  6: 35.948 ms
+  run  7: 34.984 ms
+  run  8: 34.872 ms
+  run  9: 36.515 ms
+  run 10: 36.287 ms
+  run 11: 36.513 ms
+  run 12: 36.340 ms
+  run 13: 36.367 ms
+  run 14: 36.315 ms
+  run 15: 36.302 ms
+  trimmed mean = 36.298 ms, trimmed stddev = 0.059 ms
+
+experiment: fuel
+  run  1: 43.692 ms
+  run  2: 43.052 ms
+  run  3: 43.136 ms
+  run  4: 43.028 ms
+  run  5: 43.392 ms
+  run  6: 43.107 ms
+  run  7: 43.101 ms
+  run  8: 43.058 ms
+  run  9: 43.141 ms
+  run 10: 43.093 ms
+  run 11: 43.338 ms
+  run 12: 43.460 ms
+  run 13: 43.444 ms
+  run 14: 43.317 ms
+  run 15: 43.670 ms
+  trimmed mean = 43.137 ms, trimmed stddev = 0.107 ms
+
+experiment: epoch
+  run  1: 35.358 ms
+  run  2: 35.278 ms
+  run  3: 35.023 ms
+  run  4: 35.140 ms
+  run  5: 35.154 ms
+  run  6: 35.445 ms
+  run  7: 35.330 ms
+  run  8: 35.331 ms
+  run  9: 35.300 ms
+  run 10: 35.386 ms
+  run 11: 35.308 ms
+  run 12: 35.307 ms
+  run 13: 35.365 ms
+  run 14: 35.383 ms
+  run 15: 35.386 ms
+  trimmed mean = 35.335 ms, trimmed stddev = 0.037 ms
+
+experiment: fast_baseline
+  run  1: 36.158 ms
+  run  2: 36.310 ms
+  run  3: 36.262 ms
+  run  4: 36.168 ms
+  run  5: 36.261 ms
+  run  6: 36.346 ms
+  run  7: 36.337 ms
+  run  8: 36.367 ms
+  run  9: 36.387 ms
+  run 10: 36.467 ms
+  run 11: 36.281 ms
+  run 12: 36.353 ms
+  run 13: 36.685 ms
+  run 14: 36.534 ms
+  run 15: 36.503 ms
+  trimmed mean = 36.337 ms, trimmed stddev = 0.063 ms
+
+experiment: fast_fuel
+  run  1: 43.364 ms
+  run  2: 43.258 ms
+  run  3: 43.541 ms
+  run  4: 43.331 ms
+  run  5: 43.289 ms
+  run  6: 43.177 ms
+  run  7: 43.034 ms
+  run  8: 43.235 ms
+  run  9: 43.323 ms
+  run 10: 43.316 ms
+  run 11: 43.495 ms
+  run 12: 43.099 ms
+  run 13: 43.125 ms
+  run 14: 43.097 ms
+  run 15: 43.430 ms
+  trimmed mean = 43.285 ms, trimmed stddev = 0.089 ms
+
+experiment: fast_epoch
+  run  1: 35.218 ms
+  run  2: 35.532 ms
+  run  3: 35.468 ms
+  run  4: 35.570 ms
+  run  5: 35.406 ms
+  run  6: 35.512 ms
+  run  7: 35.087 ms
+  run  8: 35.608 ms
+  run  9: 35.647 ms
+  run 10: 35.520 ms
+  run 11: 35.349 ms
+  run 12: 35.112 ms
+  run 13: 35.293 ms
+  run 14: 35.323 ms
+  run 15: 35.172 ms
+  trimmed mean = 35.419 ms, trimmed stddev = 0.119 ms
+
+==== summary (trimmed) ====
+
+baseline        mean =   36.298 ms  stddev =  0.059  overhead_mean = x1.000  overhead_std = x0.002
+fuel            mean =   43.137 ms  stddev =  0.107  overhead_mean = x1.188  overhead_std = x0.003
+epoch           mean =   35.335 ms  stddev =  0.037  overhead_mean = x0.973  overhead_std = x0.001
+fast_baseline   mean =   36.337 ms  stddev =  0.063  overhead_mean = x1.000  overhead_std = x0.002
+fast_fuel       mean =   43.285 ms  stddev =  0.089  overhead_mean = x1.191  overhead_std = x0.002
+fast_epoch      mean =   35.419 ms  stddev =  0.119  overhead_mean = x0.975  overhead_std = x0.003
+```
+
+### Source file: `docs/dot_nightly.txt`
+
+```txt
+linuxuser@vultr:~/wasm-preempt/fuel-instrument-benchmark/bench-runner$ cargo run --release -- dot
+   Compiling bench-runner v0.1.0 (/home/linuxuser/wasm-preempt/fuel-instrument-benchmark/bench-runner)
+    Finished `release` profile [optimized] target(s) in 3.18s
+     Running `target/release/bench-runner dot`
+workload = dot, iters = 50, runs = 15, drop = 5
+
+experiment: baseline
+  run  1: 47.058 ms
+  run  2: 46.530 ms
+  run  3: 37.657 ms
+  run  4: 37.465 ms
+  run  5: 37.098 ms
+  run  6: 37.306 ms
+  run  7: 38.124 ms
+  run  8: 37.675 ms
+  run  9: 45.723 ms
+  run 10: 41.583 ms
+  run 11: 37.204 ms
+  run 12: 38.090 ms
+  run 13: 37.373 ms
+  run 14: 37.218 ms
+  run 15: 37.320 ms
+  picked runs:
+    [37.657, 37.675, 37.465, 37.373, 37.320, 37.306, 38.090, 37.218, 37.204, 38.124]
+  trimmed mean = 37.543 ms, trimmed stddev = 0.338 ms
+
+experiment: fuel
+  run  1: 55.489 ms
+  run  2: 55.472 ms
+  run  3: 55.872 ms
+  run  4: 55.616 ms
+  run  5: 55.576 ms
+  run  6: 55.234 ms
+  run  7: 55.876 ms
+  run  8: 56.056 ms
+  run  9: 56.038 ms
+  run 10: 55.664 ms
+  run 11: 55.785 ms
+  run 12: 55.452 ms
+  run 13: 55.974 ms
+  run 14: 55.847 ms
+  run 15: 55.717 ms
+  picked runs:
+    [55.717, 55.664, 55.785, 55.616, 55.847, 55.576, 55.872, 55.876, 55.489, 55.472]
+  trimmed mean = 55.691 ms, trimmed stddev = 0.152 ms
+
+experiment: epoch
+  run  1: 55.516 ms
+  run  2: 55.832 ms
+  run  3: 55.945 ms
+  run  4: 55.631 ms
+  run  5: 55.340 ms
+  run  6: 55.388 ms
+  run  7: 55.978 ms
+  run  8: 55.877 ms
+  run  9: 56.032 ms
+  run 10: 56.652 ms
+  run 11: 55.741 ms
+  run 12: 56.147 ms
+  run 13: 56.405 ms
+  run 14: 57.101 ms
+  run 15: 55.685 ms
+  picked runs:
+    [55.877, 55.832, 55.945, 55.978, 55.741, 56.032, 55.685, 55.631, 56.147, 55.516]
+  trimmed mean = 55.838 ms, trimmed stddev = 0.196 ms
+
+experiment: fast_baseline
+  run  1: 37.973 ms
+  run  2: 38.109 ms
+  run  3: 37.833 ms
+  run  4: 37.752 ms
+  run  5: 36.741 ms
+  run  6: 37.337 ms
+  run  7: 37.423 ms
+  run  8: 37.587 ms
+  run  9: 37.466 ms
+  run 10: 37.179 ms
+  run 11: 38.184 ms
+  run 12: 38.502 ms
+  run 13: 37.938 ms
+  run 14: 37.823 ms
+  run 15: 37.672 ms
+  picked runs:
+    [37.752, 37.823, 37.672, 37.833, 37.587, 37.938, 37.973, 37.466, 37.423, 38.109]
+  trimmed mean = 37.758 ms, trimmed stddev = 0.223 ms
+
+experiment: fast_fuel
+  run  1: 55.433 ms
+  run  2: 55.382 ms
+  run  3: 56.376 ms
+  run  4: 56.127 ms
+  run  5: 55.926 ms
+  run  6: 55.400 ms
+  run  7: 55.092 ms
+  run  8: 55.368 ms
+  run  9: 55.289 ms
+  run 10: 55.183 ms
+  run 11: 55.361 ms
+  run 12: 55.757 ms
+  run 13: 56.225 ms
+  run 14: 54.747 ms
+  run 15: 55.378 ms
+  picked runs:
+    [55.382, 55.378, 55.368, 55.400, 55.361, 55.433, 55.289, 55.183, 55.092, 55.757]
+  trimmed mean = 55.364 ms, trimmed stddev = 0.174 ms
+
+experiment: fast_epoch
+  run  1: 55.109 ms
+  run  2: 57.044 ms
+  run  3: 54.948 ms
+  run  4: 55.298 ms
+  run  5: 54.800 ms
+  run  6: 57.296 ms
+  run  7: 55.901 ms
+  run  8: 56.874 ms
+  run  9: 56.298 ms
+  run 10: 56.504 ms
+  run 11: 55.608 ms
+  run 12: 55.513 ms
+  run 13: 55.547 ms
+  run 14: 56.267 ms
+  run 15: 56.361 ms
+  picked runs:
+    [55.901, 55.608, 55.547, 56.267, 55.513, 56.298, 56.361, 56.504, 55.298, 55.109]
+  trimmed mean = 55.841 ms, trimmed stddev = 0.493 ms
+
+==== summary (trimmed) ====
+
+baseline        mean =   37.543 ms  stddev =  0.338  overhead_mean = x1.000  overhead_std = x0.009
+fuel            mean =   55.691 ms  stddev =  0.152  overhead_mean = x1.483  overhead_std = x0.004
+epoch           mean =   55.838 ms  stddev =  0.196  overhead_mean = x1.487  overhead_std = x0.005
+fast_baseline   mean =   37.758 ms  stddev =  0.223  overhead_mean = x1.000  overhead_std = x0.006
+fast_fuel       mean =   55.364 ms  stddev =  0.174  overhead_mean = x1.466  overhead_std = x0.005
+fast_epoch      mean =   55.841 ms  stddev =  0.493  overhead_mean = x1.479  overhead_std = x0.013
+```
+
+### Source file: `docs/fib_nightly.txt`
+
+```txt
+linuxuser@vultr:~/wasm-preempt/fuel-instrument-benchmark/bench-runner$ cargo run --release -- fib
+   Compiling bench-runner v0.1.0 (/home/linuxuser/wasm-preempt/fuel-instrument-benchmark/bench-runner)
+    Finished `release` profile [optimized] target(s) in 2.98s
+     Running `target/release/bench-runner fib`
+workload = fib, iters = 50, runs = 15, drop = 5
+
+experiment: baseline
+  run  1: 36.531 ms
+  run  2: 35.537 ms
+  run  3: 36.458 ms
+  run  4: 36.621 ms
+  run  5: 34.006 ms
+  run  6: 35.286 ms
+  run  7: 37.022 ms
+  run  8: 36.180 ms
+  run  9: 36.640 ms
+  run 10: 36.906 ms
+  run 11: 36.387 ms
+  run 12: 36.578 ms
+  run 13: 36.815 ms
+  run 14: 36.428 ms
+  run 15: 37.045 ms
+  picked runs:
+    [36.531, 36.578, 36.458, 36.621, 36.428, 36.640, 36.387, 36.815, 36.180, 36.906]
+  trimmed mean = 36.554 ms, trimmed stddev = 0.210 ms
+
+experiment: fuel
+  run  1: 43.905 ms
+  run  2: 43.367 ms
+  run  3: 43.242 ms
+  run  4: 43.170 ms
+  run  5: 43.824 ms
+  run  6: 43.679 ms
+  run  7: 44.181 ms
+  run  8: 43.265 ms
+  run  9: 43.265 ms
+  run 10: 43.530 ms
+  run 11: 43.853 ms
+  run 12: 43.534 ms
+  run 13: 43.448 ms
+  run 14: 43.600 ms
+  run 15: 43.679 ms
+  picked runs:
+    [43.534, 43.530, 43.600, 43.448, 43.679, 43.679, 43.367, 43.265, 43.265, 43.824]
+  trimmed mean = 43.519 ms, trimmed stddev = 0.185 ms
+
+experiment: epoch
+  run  1: 35.300 ms
+  run  2: 35.335 ms
+  run  3: 35.425 ms
+  run  4: 35.279 ms
+  run  5: 35.483 ms
+  run  6: 35.400 ms
+  run  7: 35.385 ms
+  run  8: 35.510 ms
+  run  9: 35.383 ms
+  run 10: 35.409 ms
+  run 11: 35.593 ms
+  run 12: 35.391 ms
+  run 13: 35.462 ms
+  run 14: 35.364 ms
+  run 15: 35.760 ms
+  picked runs:
+    [35.400, 35.391, 35.409, 35.385, 35.383, 35.425, 35.364, 35.462, 35.335, 35.483]
+  trimmed mean = 35.404 ms, trimmed stddev = 0.044 ms
+
+experiment: fast_baseline
+  run  1: 36.728 ms
+  run  2: 35.493 ms
+  run  3: 36.523 ms
+  run  4: 36.426 ms
+  run  5: 36.314 ms
+  run  6: 36.284 ms
+  run  7: 36.537 ms
+  run  8: 36.391 ms
+  run  9: 35.586 ms
+  run 10: 34.169 ms
+  run 11: 34.299 ms
+  run 12: 34.214 ms
+  run 13: 36.401 ms
+  run 14: 36.391 ms
+  run 15: 36.248 ms
+  picked runs:
+    [36.314, 36.284, 36.248, 36.391, 36.391, 36.401, 36.426, 36.523, 36.537, 36.728]
+  trimmed mean = 36.424 ms, trimmed stddev = 0.142 ms
+
+experiment: fast_fuel
+  run  1: 43.498 ms
+  run  2: 43.535 ms
+  run  3: 43.855 ms
+  run  4: 43.962 ms
+  run  5: 43.723 ms
+  run  6: 43.549 ms
+  run  7: 43.677 ms
+  run  8: 44.002 ms
+  run  9: 43.843 ms
+  run 10: 44.208 ms
+  run 11: 43.322 ms
+  run 12: 43.194 ms
+  run 13: 43.063 ms
+  run 14: 43.056 ms
+  run 15: 43.102 ms
+  picked runs:
+    [43.549, 43.535, 43.498, 43.677, 43.723, 43.322, 43.843, 43.855, 43.194, 43.962]
+  trimmed mean = 43.616 ms, trimmed stddev = 0.243 ms
+
+experiment: fast_epoch
+  run  1: 35.627 ms
+  run  2: 35.618 ms
+  run  3: 35.443 ms
+  run  4: 35.536 ms
+  run  5: 36.908 ms
+  run  6: 37.111 ms
+  run  7: 36.197 ms
+  run  8: 35.977 ms
+  run  9: 35.855 ms
+  run 10: 35.737 ms
+  run 11: 35.577 ms
+  run 12: 35.505 ms
+  run 13: 35.295 ms
+  run 14: 35.433 ms
+  run 15: 35.334 ms
+  picked runs:
+    [35.618, 35.627, 35.577, 35.536, 35.505, 35.737, 35.443, 35.433, 35.855, 35.334]
+  trimmed mean = 35.567 ms, trimmed stddev = 0.153 ms
+
+==== summary (trimmed) ====
+
+baseline        mean =   36.554 ms  stddev =  0.210  overhead_mean = x1.000  overhead_std = x0.006
+fuel            mean =   43.519 ms  stddev =  0.185  overhead_mean = x1.191  overhead_std = x0.005
+epoch           mean =   35.404 ms  stddev =  0.044  overhead_mean = x0.969  overhead_std = x0.001
+fast_baseline   mean =   36.424 ms  stddev =  0.142  overhead_mean = x1.000  overhead_std = x0.004
+fast_fuel       mean =   43.616 ms  stddev =  0.243  overhead_mean = x1.197  overhead_std = x0.007
+fast_epoch      mean =   35.567 ms  stddev =  0.153  overhead_mean = x0.976  overhead_std = x0.004
+```
+
+### Source file: `docs/matmul_nightly.txt`
+
+```txt
+linuxuser@vultr:~/wasm-preempt/fuel-instrument-benchmark/bench-runner$ cargo run --release -- matmul
+   Compiling bench-runner v0.1.0 (/home/linuxuser/wasm-preempt/fuel-instrument-benchmark/bench-runner)
+    Finished `release` profile [optimized] target(s) in 3.14s
+     Running `target/release/bench-runner matmul`
+workload = matmul, iters = 5, runs = 15, drop = 5
+
+experiment: baseline
+  run  1: 430.503 ms
+  run  2: 412.367 ms
+  run  3: 416.936 ms
+  run  4: 428.965 ms
+  run  5: 420.334 ms
+  run  6: 423.395 ms
+  run  7: 414.634 ms
+  run  8: 413.756 ms
+  run  9: 412.775 ms
+  run 10: 402.115 ms
+  run 11: 423.185 ms
+  run 12: 417.575 ms
+  run 13: 415.111 ms
+  run 14: 450.962 ms
+  run 15: 428.533 ms
+  picked runs:
+    [417.575, 416.936, 415.111, 420.334, 414.634, 413.756, 412.775, 412.367, 423.185, 423.395]
+  trimmed mean = 417.007 ms, trimmed stddev = 4.077 ms
+
+experiment: fuel
+  run  1: 527.198 ms
+  run  2: 538.172 ms
+  run  3: 520.967 ms
+  run  4: 522.052 ms
+  run  5: 518.400 ms
+  run  6: 525.024 ms
+  run  7: 516.946 ms
+  run  8: 520.697 ms
+  run  9: 520.906 ms
+  run 10: 518.016 ms
+  run 11: 516.700 ms
+  run 12: 533.962 ms
+  run 13: 541.633 ms
+  run 14: 506.426 ms
+  run 15: 528.294 ms
+  picked runs:
+    [520.967, 520.906, 520.697, 522.052, 518.400, 518.016, 516.946, 525.024, 516.700, 527.198]
+  trimmed mean = 520.691 ms, trimmed stddev = 3.423 ms
+
+experiment: epoch
+  run  1: 618.262 ms
+  run  2: 622.973 ms
+  run  3: 627.305 ms
+  run  4: 631.326 ms
+  run  5: 629.981 ms
+  run  6: 666.339 ms
+  run  7: 668.309 ms
+  run  8: 663.166 ms
+  run  9: 664.210 ms
+  run 10: 646.957 ms
+  run 11: 645.007 ms
+  run 12: 608.920 ms
+  run 13: 614.701 ms
+  run 14: 637.741 ms
+  run 15: 625.845 ms
+  picked runs:
+    [631.326, 629.981, 627.305, 625.845, 637.741, 622.973, 618.262, 645.007, 646.957, 614.701]
+  trimmed mean = 630.010 ms, trimmed stddev = 10.647 ms
+
+experiment: fast_baseline
+  run  1: 406.019 ms
+  run  2: 413.576 ms
+  run  3: 438.558 ms
+  run  4: 463.173 ms
+  run  5: 424.765 ms
+  run  6: 447.991 ms
+  run  7: 449.707 ms
+  run  8: 442.994 ms
+  run  9: 429.342 ms
+  run 10: 425.878 ms
+  run 11: 426.172 ms
+  run 12: 430.329 ms
+  run 13: 438.532 ms
+  run 14: 438.878 ms
+  run 15: 430.942 ms
+  picked runs:
+    [430.942, 430.329, 429.342, 426.172, 425.878, 424.765, 438.532, 438.558, 438.878, 442.994]
+  trimmed mean = 432.639 ms, trimmed stddev = 6.536 ms
+
+experiment: fast_fuel
+  run  1: 555.595 ms
+  run  2: 559.172 ms
+  run  3: 545.284 ms
+  run  4: 556.027 ms
+  run  5: 538.037 ms
+  run  6: 536.162 ms
+  run  7: 568.673 ms
+  run  8: 565.085 ms
+  run  9: 539.670 ms
+  run 10: 530.611 ms
+  run 11: 525.532 ms
+  run 12: 521.419 ms
+  run 13: 534.677 ms
+  run 14: 530.096 ms
+  run 15: 529.106 ms
+  picked runs:
+    [538.037, 539.670, 536.162, 534.677, 545.284, 530.611, 530.096, 529.106, 525.532, 521.419]
+  trimmed mean = 533.059 ms, trimmed stddev = 7.093 ms
+
+experiment: fast_epoch
+  run  1: 641.328 ms
+  run  2: 662.938 ms
+  run  3: 657.412 ms
+  run  4: 641.537 ms
+  run  5: 630.379 ms
+  run  6: 626.439 ms
+  run  7: 634.883 ms
+  run  8: 616.367 ms
+  run  9: 618.690 ms
+  run 10: 632.419 ms
+  run 11: 614.351 ms
+  run 12: 622.343 ms
+  run 13: 613.402 ms
+  run 14: 627.144 ms
+  run 15: 684.963 ms
+  picked runs:
+    [630.379, 632.419, 627.144, 626.439, 634.883, 622.343, 641.328, 641.537, 618.690, 616.367]
+  trimmed mean = 629.153 ms, trimmed stddev = 8.675 ms
+
+==== summary (trimmed) ====
+
+baseline        mean =  417.007 ms  stddev =  4.077  overhead_mean = x1.000  overhead_std = x0.010
+fuel            mean =  520.691 ms  stddev =  3.423  overhead_mean = x1.249  overhead_std = x0.008
+epoch           mean =  630.010 ms  stddev = 10.647  overhead_mean = x1.511  overhead_std = x0.026
+fast_baseline   mean =  432.639 ms  stddev =  6.536  overhead_mean = x1.000  overhead_std = x0.015
+fast_fuel       mean =  533.059 ms  stddev =  7.093  overhead_mean = x1.232  overhead_std = x0.016
+fast_epoch      mean =  629.153 ms  stddev =  8.675  overhead_mean = x1.454  overhead_std = x0.020
+```
+
+### Source file: `.gitignore`
+
+```
+/target
+
+```
+
+---
+
+preempt_demo>
+linuxuser@vultr:~/wasm-preempt/wasmtime$ cargo run --release --example preempt_demo
+   Compiling wasmtime v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasmtime)
+   Compiling wiggle v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wiggle)
+   Compiling wasmtime-wasi-io v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi-io)
+   Compiling wasmtime-internal-explorer v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/explorer)
+   Compiling wasi-common v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi-common)
+   Compiling wasmtime-wasi v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi)
+   Compiling wasmtime-wasi-nn v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi-nn)
+   Compiling wasmtime-cli-flags v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/cli-flags)
+   Compiling wasmtime-wast v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wast)
+   Compiling wasmtime-wasi-http v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi-http)
+   Compiling wasmtime-wasi-threads v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi-threads)
+   Compiling wasmtime-wasi-tls v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi-tls)
+   Compiling wasmtime-wasi-keyvalue v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi-keyvalue)
+   Compiling wasmtime-wizer v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wizer)
+   Compiling wasmtime-wasi-config v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/wasi-config)
+   Compiling wasmtime-cli v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime)
+   Compiling test-programs-artifacts v0.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/test-programs/artifacts)
+   Compiling wasmtime-test-util v40.0.0 (/home/linuxuser/wasm-preempt/wasmtime/crates/test-util)
+    Finished `release` profile [optimized] target(s) in 3m 57s
+     Running `target/release/examples/preempt_demo`
+[preempt][spawn] fiber 0 for export
+[preempt][spawn] fiber 1 for export
+[preempt][spawn] fiber 2 for export
+[preempt][fuel] configuring slice=100
+[preempt][fuel] set_fuel: new_fuel=0 interval=100 injected=0 reserve=0
+[preempt][fuel] set_fuel: new_fuel=18446744073709551615 interval=100 injected=-100 reserve=18446744073709551515
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[thread0] 0
+[thread0] 1
+[thread0] 2
+[thread0] 3
+[thread0] 4
+[thread0] 5
+[thread0] 6
+[thread0] 7
+[thread0] 8
+[thread0] 9
+[thread0] 10
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=0 reserve=18446744073709551515 interval=Some(100) fuel=18446744073709551515
+[preempt][fuel] set_fuel: new_fuel=18446744073709551515 interval=100 injected=-100 reserve=18446744073709551415
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[thread1] 0
+[thread1] 1
+[thread1] 2
+[thread1] 3
+[thread1] 4
+[thread1] 5
+[thread1] 6
+[thread1] 7
+[thread1] 8
+[thread1] 9
+[thread1] 10
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=0 reserve=18446744073709551415 interval=Some(100) fuel=18446744073709551415
+[preempt][fuel] set_fuel: new_fuel=18446744073709551415 interval=100 injected=-100 reserve=18446744073709551315
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 2
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[thread2] 0
+[thread2] 1
+[thread2] 2
+[thread2] 3
+[thread2] 4
+[thread2] 5
+[thread2] 6
+[thread2] 7
+[thread2] 8
+[thread2] 9
+[thread2] 10
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=0 reserve=18446744073709551315 interval=Some(100) fuel=18446744073709551315
+[preempt][fuel] set_fuel: new_fuel=18446744073709551315 interval=100 injected=-100 reserve=18446744073709551215
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][run] fiber 2 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread0] 11
+[thread0] 12
+[thread0] 13
+[thread0] 14
+[thread0] 15
+[thread0] 16
+[thread0] 17
+[thread0] 18
+[thread0] 19
+[thread0] 20
+[thread0] 21
+[thread0] 22
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709551215 interval=Some(100) fuel=18446744073709551207
+[preempt][fuel] set_fuel: new_fuel=18446744073709551207 interval=100 injected=-100 reserve=18446744073709551107
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread1] 11
+[thread1] 12
+[thread1] 13
+[thread1] 14
+[thread1] 15
+[thread1] 16
+[thread1] 17
+[thread1] 18
+[thread1] 19
+[thread1] 20
+[thread1] 21
+[thread1] 22
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709551107 interval=Some(100) fuel=18446744073709551099
+[preempt][fuel] set_fuel: new_fuel=18446744073709551099 interval=100 injected=-100 reserve=18446744073709550999
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 2
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread2] 11
+[thread2] 12
+[thread2] 13
+[thread2] 14
+[thread2] 15
+[thread2] 16
+[thread2] 17
+[thread2] 18
+[thread2] 19
+[thread2] 20
+[thread2] 21
+[thread2] 22
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550999 interval=Some(100) fuel=18446744073709550991
+[preempt][fuel] set_fuel: new_fuel=18446744073709550991 interval=100 injected=-100 reserve=18446744073709550891
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][run] fiber 2 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread0] 23
+[thread0] 24
+[thread0] 25
+[thread0] 26
+[thread0] 27
+[thread0] 28
+[thread0] 29
+[thread0] 30
+[thread0] 31
+[thread0] 32
+[thread0] 33
+[thread0] 34
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550891 interval=Some(100) fuel=18446744073709550883
+[preempt][fuel] set_fuel: new_fuel=18446744073709550883 interval=100 injected=-100 reserve=18446744073709550783
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread1] 23
+[thread1] 24
+[thread1] 25
+[thread1] 26
+[thread1] 27
+[thread1] 28
+[thread1] 29
+[thread1] 30
+[thread1] 31
+[thread1] 32
+[thread1] 33
+[thread1] 34
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550783 interval=Some(100) fuel=18446744073709550775
+[preempt][fuel] set_fuel: new_fuel=18446744073709550775 interval=100 injected=-100 reserve=18446744073709550675
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 2
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread2] 23
+[thread2] 24
+[thread2] 25
+[thread2] 26
+[thread2] 27
+[thread2] 28
+[thread2] 29
+[thread2] 30
+[thread2] 31
+[thread2] 32
+[thread2] 33
+[thread2] 34
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550675 interval=Some(100) fuel=18446744073709550667
+[preempt][fuel] set_fuel: new_fuel=18446744073709550667 interval=100 injected=-100 reserve=18446744073709550567
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][run] fiber 2 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread0] 35
+[thread0] 36
+[thread0] 37
+[thread0] 38
+[thread0] 39
+[thread0] 40
+[thread0] 41
+[thread0] 42
+[thread0] 43
+[thread0] 44
+[thread0] 45
+[thread0] 46
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550567 interval=Some(100) fuel=18446744073709550559
+[preempt][fuel] set_fuel: new_fuel=18446744073709550559 interval=100 injected=-100 reserve=18446744073709550459
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread1] 35
+[thread1] 36
+[thread1] 37
+[thread1] 38
+[thread1] 39
+[thread1] 40
+[thread1] 41
+[thread1] 42
+[thread1] 43
+[thread1] 44
+[thread1] 45
+[thread1] 46
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550459 interval=Some(100) fuel=18446744073709550451
+[preempt][fuel] set_fuel: new_fuel=18446744073709550451 interval=100 injected=-100 reserve=18446744073709550351
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 2
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread2] 35
+[thread2] 36
+[thread2] 37
+[thread2] 38
+[thread2] 39
+[thread2] 40
+[thread2] 41
+[thread2] 42
+[thread2] 43
+[thread2] 44
+[thread2] 45
+[thread2] 46
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550351 interval=Some(100) fuel=18446744073709550343
+[preempt][fuel] set_fuel: new_fuel=18446744073709550343 interval=100 injected=-100 reserve=18446744073709550243
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][run] fiber 2 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread0] 47
+[thread0] 48
+[thread0] 49
+[thread0] 50
+[thread0] 51
+[thread0] 52
+[thread0] 53
+[thread0] 54
+[thread0] 55
+[thread0] 56
+[thread0] 57
+[thread0] 58
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550243 interval=Some(100) fuel=18446744073709550235
+[preempt][fuel] set_fuel: new_fuel=18446744073709550235 interval=100 injected=-100 reserve=18446744073709550135
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread1] 47
+[thread1] 48
+[thread1] 49
+[thread1] 50
+[thread1] 51
+[thread1] 52
+[thread1] 53
+[thread1] 54
+[thread1] 55
+[thread1] 56
+[thread1] 57
+[thread1] 58
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550135 interval=Some(100) fuel=18446744073709550127
+[preempt][fuel] set_fuel: new_fuel=18446744073709550127 interval=100 injected=-100 reserve=18446744073709550027
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 2
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread2] 47
+[thread2] 48
+[thread2] 49
+[thread2] 50
+[thread2] 51
+[thread2] 52
+[thread2] 53
+[thread2] 54
+[thread2] 55
+[thread2] 56
+[thread2] 57
+[thread2] 58
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709550027 interval=Some(100) fuel=18446744073709550019
+[preempt][fuel] set_fuel: new_fuel=18446744073709550019 interval=100 injected=-100 reserve=18446744073709549919
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb1f9000
+[preempt][fiber][thread2] switching to fiber stack top=0x00007134cb7fc000
+[preempt][run] fiber 2 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread0] 59
+[thread0] 60
+[thread0] 61
+[thread0] 62
+[thread0] 63
+[thread0] 64
+[thread0] 65
+[thread0] 66
+[thread0] 67
+[thread0] 68
+[thread0] 69
+[thread0] 70
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709549919 interval=Some(100) fuel=18446744073709549911
+[preempt][fuel] set_fuel: new_fuel=18446744073709549911 interval=100 injected=-100 reserve=18446744073709549811
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cb5fb000
+[preempt][fiber][thread0] switching to fiber stack top=0x00007134cbbfe000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][yield] resumed fiber after suspension (blocking ctx)
+[thread1] 59
+[thread1] 60
+[thread1] 61
+[thread1] 62
+[thread1] 63
+[thread1] 64
+[thread1] 65
+[thread1] 66
+[thread1] 67
+[thread1] 68
+[thread1] 69
+[thread1] 70
+[preempt][fuel] out_of_gas: preemptive=true yield_interval=Some(100)
+[preempt][fuel] refuel: injected=8 reserve=18446744073709549811 interval=Some(100) fuel=18446744073709549803
+[preempt][fuel] set_fuel: new_fuel=18446744073709549803 interval=100 injected=-100 reserve=18446744073709549703
+[preempt][yield] using current blocking ctx to suspend
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb3fa000
+[preempt][fiber][thread1] switching to fiber stack top=0x00007134cb9fd000
+[preempt][run] fiber 1 yielded
+[preempt][fiber] switching to fiber stack top=0x00007134cbbfe000
+[preempt][fiber] switching to fiber stack top=0x00007134cb5fb000
+[preempt][yield] skipped: no current async context
+[thread0] 71
+[thread0] 72
+[thread0] 73
+[thread0] 74
+[thread0] 75
+[thread0] 76
+[thread0] 77
+[thread0] 78
+[thread0] 79
+[thread0] 80
+[thread0] 81
+[thread0] 82
+
+thread 'main' (100189) panicked at crates/wasmtime/src/runtime/fiber.rs:233:70:
+called `Option::unwrap()` on a `None` value
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[preempt][fiber] switching to fiber stack top=0x00007134cb5fb000
+[preempt][fiber] switching to fiber stack top=0x00007134cbbfe000
+
+thread 'main' (100189) panicked at crates/wasmtime/src/runtime/fiber.rs:483:9:
+attempted to drop in-progress fiber without first calling `StoreFiber::dispose`
+stack backtrace:
+   0:     0x5e1fa4275f72 - <std::sys::backtrace::BacktraceLock::print::DisplayBacktrace as core::fmt::Display>::fmt::haa87a551a4affa55
+   1:     0x5e1fa428975f - core::fmt::write::h80461e1e45e4fdd2
+   2:     0x5e1fa424ad41 - std::io::Write::write_fmt::h6e6c69b2d6337d9b
+   3:     0x5e1fa42530d2 - std::sys::backtrace::BacktraceLock::print::hf67a46baa621998e
+   4:     0x5e1fa425874f - std::panicking::default_hook::{{closure}}::h391aa815d5e47ec8
+   5:     0x5e1fa42585a9 - std::panicking::default_hook::hd6fdcf2489bb807d
+   6:     0x5e1fa4258e85 - std::panicking::panic_with_hook::h185ddfb86bf14d73
+   7:     0x5e1fa4258c36 - std::panicking::panic_handler::{{closure}}::had89ddd01b6112c9
+   8:     0x5e1fa4253209 - std::sys::backtrace::__rust_end_short_backtrace::h5d0fc36eef7265ea
+   9:     0x5e1fa423e5ad - __rustc[eb8946e36839644a]::rust_begin_unwind
+  10:     0x5e1fa42942f0 - core::panicking::panic_fmt::h92c8e5abe71dd8d1
+  11:     0x5e1fa325e5f8 - <wasmtime::runtime::fiber::StoreFiber as core::ops::drop::Drop>::drop::h6b98bd0e95ee2263
+  12:     0x5e1fa322a158 - core::ptr::drop_in_place<(u32,wasmtime::runtime::fiber::StoreFiber)>::h4db688acaa6a70d3
+  13:     0x5e1fa3245db9 - core::ptr::drop_in_place<wasmtime::preemptive::PreemptiveThreads>::h5fce7f65cb68ebd2
+  14:     0x5e1fa32457a5 - core::ptr::drop_in_place<wasmtime::runtime::store::StoreOpaque>::h8eca8c1c0111e8f8
+  15:     0x5e1fa3247550 - core::ptr::drop_in_place<wasmtime::runtime::store::StoreInner<preempt_demo::HostState>>::hef2b46d82b4718fb
+  16:     0x5e1fa32479e8 - <wasmtime::runtime::store::Store<T> as core::ops::drop::Drop>::drop::hb21432e13953060f
+  17:     0x5e1fa32313e4 - preempt_demo::main::h54a8f06539bbf9a1
+  18:     0x5e1fa32541a3 - std::sys::backtrace::__rust_begin_short_backtrace::h5695864dede8fae0
+  19:     0x5e1fa32540fd - std::rt::lang_start::{{closure}}::hd92acbdd8c9f4dbf
+  20:     0x5e1fa424c680 - std::rt::lang_start_internal::h6ba36b077a531782
+  21:     0x5e1fa3233755 - main
+  22:     0x7134d462a1ca - <unknown>
+  23:     0x7134d462a28b - __libc_start_main
+  24:     0x5e1fa32138e5 - _start
+  25:                0x0 - <unknown>
+
+thread 'main' (100189) panicked at library/core/src/panicking.rs:233:5:
+panic in a destructor during cleanup
+thread caused non-unwinding panic. aborting.
+Aborted (core dumped)
+
+这个panic是已知问题，还没有来得及修复。
+</preempt_demo>
+
+<preempt_matmul_demo>
+linuxuser@vultr:~/wasm-preempt/wasmtime$ cargo run --release --example preempt_dot_demo -- epoch
+    Finished `release` profile [optimized] target(s) in 1.20s
+     Running `target/release/examples/preempt_dot_demo epoch`
+[preempt][spawn] fiber 0 for export
+[preempt][spawn] fiber 1 for export
+[preempt][epoch] deadline slice=100
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][epoch] tick: requeue fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][epoch] tick: requeue fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][epoch] tick: requeue fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][epoch] tick: requeue fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][epoch] tick: requeue fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][epoch] tick: requeue fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][epoch] tick: requeue fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][epoch] tick: requeue fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][epoch] tick: requeue fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][run] fiber 0 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][epoch] tick: requeue fiber 1
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b54789b7000
+[preempt][fiber][sleep_loop] switching to fiber stack top=0x00007b5478ffb000
+[preempt][run] fiber 1 yielded
+[preempt][run] loop tick
+[preempt][run] schedule fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][epoch] tick: requeue fiber 0
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b5478bf9000
+[preempt][fiber][matmul_loop] switching to fiber stack top=0x00007b54791fc000
+[preempt][run] fiber 0 yielded
+[preempt][fiber] switching to fiber stack top=0x00007b54791fc000
+[preempt][fiber] switching to fiber stack top=0x00007b5478bf9000
+[preempt][fiber] switching to fiber stack top=0x00007b5478bf9000
+[preempt][fiber] switching to fiber stack top=0x00007b54791fc000
+[preempt][fiber] switching to fiber stack top=0x00007b5478ffb000
+[preempt][fiber] switching to fiber stack top=0x00007b54789b7000
+[preempt][fiber] switching to fiber stack top=0x00007b54789b7000
+[preempt][fiber] switching to fiber stack top=0x00007b5478ffb000
+Inputs: A[i,j]=i+j, B=identity (n=1024). Expect C == A.
+C[0,0] = 0.0 (expected 0.0), A[0,0] = 0.0
+C[5,7] = 12.0 (expected 12.0), A[5,7] = 12.0
+C[123,321] = 444.0 (expected 444.0), A[123,321] = 444.0
+mode=Epoch matmul n=1024 (sleep loop active) samples: [(0, 0), (5, 7), (123, 321)]
+现在这个fuel运行会在结果输出之前因为panic导致结束，所以只能展示epoch的。
+
+</preempt_matmul_demo>
+</results>
