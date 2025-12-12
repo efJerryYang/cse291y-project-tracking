@@ -1,12 +1,12 @@
-# CSE291Y Project - Secure Threading in Wasmtime
+# CSE291Y Project - Preemptive Threading in Wasmtime
 
-**Topics**: Primarily on the shared-memory issues of what the Wasmtime developers already aware of. Afterwards if we still have time, we will look at verification on the threading implementation.
-
+**Topics**: Multi-tasking support in user-level threads (fibers) of Wasmtime, primarily focusing on context switch (sync/async handling) and scheduling behavior.
 **Team**: [@efJerryYang](https://github.com/efJerryYang), [@Blek1](https://github.com/Blek1)
 
 **Upstream**: [Wasmtime](https://github.com/bytecodealliance/wasmtime)
 
 - Code Update: https://github.com/efJerryYang/wasmtime/tree/dev-preempt-rewrite
+- Note: at the moment, the fork is way behind the upstream due to conflicts, will only try to resolve it when we actually at the stage of submitting the PR.
 
 <!-- **Milestones**: Check out the **[Projects](https://github.com/efJerryYang/cse291y-project-tracking/projects?query=is%3Aopen)** tab for more details: -->
 
